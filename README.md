@@ -42,6 +42,29 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
 }
 ```
 
+### Optional: OpenCode `full_codemode` (Experimental)
+
+By default, OpenCode's Code Mode (`execute`, relayed here as `mcp_oc_execute`) exposes MCP servers and `tools.opencode.*`, while local file reads/edits/shell run through `agy`'s fast native tools.
+
+If you also want scripted batch file I/O (`Bun.file`, `Bun.write`, `Bun.Glob`), `fetch`, and Code Mode `shell`/`patch` available inside `mcp_oc_execute`, you can opt into OpenCode's user-level `full_codemode` flag (note: this is an OpenCode core work-in-progress setting and applies to **all** models in your OpenCode instance):
+
+```sh
+# Try for a single isolated session:
+OPENCODE_FLAGS=full_codemode opencode --standalone
+```
+
+Or enable persistently in `opencode.json` (then run `opencode reload`):
+
+```json
+{
+  "experimental": {
+    "full_codemode": true
+  }
+}
+```
+
+No extra plugin configuration is needed — `codeMode: "auto"` automatically relays `execute` as `mcp_oc_execute`.
+
 ### Environment overrides
 
 - `AGY_BIN`: explicit path to `agy`
@@ -61,4 +84,39 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
 bun install
 bun run typecheck
 bun test
+```
+
+## Installation
+
+Requires OpenCode **2.4+** and the Google Antigravity CLI (`agy`) installed and signed in (`agy`).
+
+### Option 1: Install via OpenCode CLI (managed)
+
+```sh
+opencode plugin add github:brandonkramer/opencode-agy-acp
+opencode reload
+```
+
+Update later with `opencode plugin update`.
+
+### Option 2: Local checkout (recommended for development)
+
+```sh
+git clone https://github.com/brandonkramer/opencode-agy-acp.git
+cd opencode-agy-acp
+bun install
+```
+
+Add the checkout's absolute path to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugins": ["/absolute/path/to/opencode-agy-acp"]
+}
+```
+
+Then reload OpenCode:
+
+```sh
+opencode reload
 ```

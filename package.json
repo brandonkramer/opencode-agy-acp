@@ -4,6 +4,10 @@
   "description": "Lean, deadlock-free OpenCode plugin for Google Antigravity CLI (agy acp) with stream-idle watchdogs, structured Effect concurrency, and full elicitation bridging.",
   "license": "MIT",
   "type": "module",
+  "files": [
+    "src/",
+    "README.md"
+  ],
   "exports": {
     ".": "./src/index.ts",
     "./rpc": "./src/rpc.ts"
