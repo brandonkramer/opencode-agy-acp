@@ -24,6 +24,7 @@ function createMockContext(opts?: {
 }) {
   const store = new Map<string, unknown>()
   const cwd = opts?.cwd ?? process.cwd()
+  let sessionGetCalls = 0
   const ctx = {
     location: { directory: cwd },
     storage: {
@@ -38,7 +39,11 @@ function createMockContext(opts?: {
         }),
     },
     session: {
-      get: () => Effect.succeed({ location: { directory: cwd } } as never),
+      get: () =>
+        Effect.sync(() => {
+          sessionGetCalls++
+          return { location: { directory: cwd } } as never
+        }),
       update: () => Effect.void,
     },
     permission: {
@@ -46,7 +51,7 @@ function createMockContext(opts?: {
     },
   } as unknown as Context
 
-  return { ctx, store }
+  return { ctx, store, getSessionGetCalls: () => sessionGetCalls }
 }
 
 function makeSettings(overrides: Partial<AgySettings> = {}): AgySettings {
@@ -109,6 +114,7 @@ describe("SessionRegistry + fake-agy integration", () => {
       expect(finish?.type === "finish" && finish.usage.inputTokens.total).toBe(100)
 
       const loggedArgs = JSON.parse(fs.readFileSync(argsLog, "utf8").trim()) as string[]
+      expect(loggedArgs).toContain("--disable-telemetry")
       expect(loggedArgs).toContain("--include-default-customizations=false")
       expect(loggedArgs).not.toContain("--process-per-session")
     } finally {
@@ -913,7 +919,7 @@ describe("SessionRegistry + fake-agy integration", () => {
   })
 
   test("16. Hybrid auto Code Mode enables only for non-shadowed tools and ignores shadowed tool churn", async () => {
-    const { ctx } = createMockContext()
+    const { ctx, getSessionGetCalls } = createMockContext()
     const registry = new SessionRegistry(ctx, {
       settings: makeSettings({
         codeMode: "auto",
@@ -981,6 +987,7 @@ describe("SessionRegistry + fake-agy integration", () => {
         }
       ).sessionId
       expect(sid2).toBe(sid1)
+      expect(getSessionGetCalls()).toBe(1)
     } finally {
       await registry.disposeAll()
     }

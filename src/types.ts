@@ -38,6 +38,7 @@ export interface AgySettings {
   readonly forwardInstructions: boolean
   readonly codeMode: CodeModeSetting
   readonly prewarm: boolean
+  readonly smoothStreaming: boolean
   readonly maxSystemPromptChars: number
   readonly extraRelayedTools: readonly string[]
   readonly blockedRelayedTools: readonly string[]
@@ -57,6 +58,7 @@ export const DEFAULT_SETTINGS: AgySettings = {
   forwardInstructions: true,
   codeMode: "auto",
   prewarm: true,
+  smoothStreaming: true,
   maxSystemPromptChars: 120_000,
   extraRelayedTools: [],
   blockedRelayedTools: [],
@@ -148,6 +150,10 @@ export function resolveSettings(
       base.forwardInstructions,
     codeMode: readCodeMode(rawSettings.codeMode) ?? readCodeMode(env.AGY_ACP_CODE_MODE) ?? base.codeMode,
     prewarm: readBool(rawSettings.prewarm) ?? readBool(env.AGY_ACP_PREWARM) ?? base.prewarm,
+    smoothStreaming:
+      readBool(rawSettings.smoothStreaming) ??
+      readBool(env.AGY_ACP_SMOOTH_STREAMING) ??
+      base.smoothStreaming,
     maxSystemPromptChars:
       readPositiveInt(rawSettings.maxSystemPromptChars) ??
       readPositiveInt(env.AGY_ACP_MAX_SYSTEM_PROMPT_CHARS) ??

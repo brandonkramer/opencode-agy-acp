@@ -918,6 +918,16 @@ export class SessionRegistry {
       readonly systemPromptHash?: string
     },
   ): Promise<{ proc: AcpProcess; acpSessionId: string; freshSession: boolean }> {
+    // Fast path: reuse live proc + session without redundant session.get / relay startup work.
+    if (
+      entry.proc &&
+      !entry.proc.isClosed &&
+      entry.acpSessionId &&
+      entry.acpToolsSignature === this.acpToolsSignatureFor(entry)
+    ) {
+      return { proc: entry.proc, acpSessionId: entry.acpSessionId, freshSession: false }
+    }
+
     try {
       const info = await Effect.runPromise(
         this.ctx.session.get({ sessionID: entry.sessionID as Session.ID }),
@@ -947,11 +957,8 @@ export class SessionRegistry {
     const systemPromptHash = options?.systemPromptHash
     const recorded = options?.recorded
 
-    // Reuse live proc + session if alive and tool signature matches.
+    // Refresh ACP session in-place if alive but the relayed tool signature changed.
     if (entry.proc && !entry.proc.isClosed && entry.acpSessionId) {
-      if (entry.acpToolsSignature === this.acpToolsSignatureFor(entry)) {
-        return { proc: entry.proc, acpSessionId: entry.acpSessionId, freshSession: false }
-      }
       const oldId = entry.acpSessionId
       try {
         await entry.proc.closeSession(oldId)
@@ -972,7 +979,7 @@ export class SessionRegistry {
           await entry.proc.setMode(entry.acpSessionId, desiredMode).catch(() => {})
           entry.lastModeApplied = desiredMode
         }
-        await this.runStorageSetRecord(entry, {
+        void this.runStorageSetRecord(entry, {
           version: 1,
           acpSessionId: entry.acpSessionId,
           turns: recorded?.turns ?? entry.persistedRecord?.turns ?? [],
@@ -1064,7 +1071,7 @@ export class SessionRegistry {
     entry.acpToolsSignature = this.acpToolsSignatureFor(entry)
     entry.lastError = null
     entry.lastSystemPromptHash = systemPromptHash
-    await this.runStorageSetRecord(entry, {
+    void this.runStorageSetRecord(entry, {
       version: 1,
       acpSessionId: entry.acpSessionId,
       turns: freshSession ? [] : (recorded?.turns ?? []),
@@ -1513,6 +1520,7 @@ export class SessionRegistry {
       pauseWatchdog: () => proc.pauseWatchdog(),
       resumeWatchdog: () => proc.resumeWatchdog(),
       nativeFlushGraceMs: runtimeSettings.nativeFlushGraceMs,
+      smoothStreaming: runtimeSettings.smoothStreaming,
       getKnownRelayedNames: () =>
         new Set(entry.contextSnapshot?.mcpDescriptors.map((d) => d.name) ?? []),
       onInterruptRequested: (reason) => {

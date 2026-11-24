@@ -198,7 +198,7 @@ export class AcpProcess {
     }
     const io = options.io ?? defaultAgyIO
     const env = io.env()
-    const args = ["acp", "--stdio"]
+    const args = ["acp", "--stdio", "--disable-telemetry"]
     if (options.processPerSession) {
       args.push("--process-per-session")
     }

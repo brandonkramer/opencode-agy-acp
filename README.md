@@ -31,6 +31,7 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
         "forwardInstructions": true,
         "codeMode": "auto",
         "prewarm": true,
+        "smoothStreaming": true,
         "includeDefaultCustomizations": false,
         "chunkTimeoutMs": 120000,
         "permissionTimeoutMs": 300000,
@@ -48,6 +49,7 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
 - `AGY_ACP_FORWARD_INSTRUCTIONS=true|false`
 - `AGY_ACP_CODE_MODE=auto|true|false`
 - `AGY_ACP_PREWARM=true|false`
+- `AGY_ACP_SMOOTH_STREAMING=true|false`
 - `AGY_ACP_MAX_SYSTEM_PROMPT_CHARS`
 - `AGY_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS=true|false`
 - `AGY_ACP_CHUNK_TIMEOUT_MS`

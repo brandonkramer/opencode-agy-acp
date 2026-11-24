@@ -30,6 +30,50 @@ const TERMINAL_TOOL_STATUSES = new Set([
 
 const ERROR_TOOL_STATUSES = new Set(["failed", "error", "cancelled", "canceled", "denied", "rejected"])
 
+const SMOOTH_MIN_CHUNK_CHARS = 32
+const SMOOTH_TARGET_TICKS = 12
+const SMOOTH_MIN_SLICE_CHARS = 16
+const DEFAULT_SMOOTH_INTERVAL_MS = 14
+
+/** Split a bursty text chunk at a nearby word boundary without breaking UTF-16 surrogate pairs. */
+export function takeSmoothSlice(text: string, targetChars: number): readonly [string, string] {
+  if (text.length <= targetChars) return [text, ""]
+
+  let cut = Math.min(text.length, Math.max(1, targetChars))
+  const fwdLimit = Math.min(text.length, cut + 12)
+  let foundBoundary = false
+  for (let i = cut; i < fwdLimit; i++) {
+    const ch = text.charCodeAt(i)
+    if (ch === 32 || ch === 10 || ch === 9) {
+      cut = i + 1
+      foundBoundary = true
+      break
+    }
+  }
+  if (!foundBoundary) {
+    const backLimit = Math.max(4, cut - 8)
+    for (let i = cut - 1; i >= backLimit; i--) {
+      const ch = text.charCodeAt(i)
+      if (ch === 32 || ch === 10 || ch === 9) {
+        cut = i + 1
+        break
+      }
+    }
+  }
+
+  if (cut < text.length) {
+    const prevCode = text.charCodeAt(cut - 1)
+    if (prevCode >= 0xd800 && prevCode <= 0xdbff) {
+      cut = Math.min(text.length, cut + 1)
+    }
+  }
+  if (text.length - cut <= 6) {
+    cut = text.length
+  }
+
+  return [text.slice(0, cut), text.slice(cut)]
+}
+
 export function buildUsage(
   raw?: AcpUsagePayload,
   activeContextUsed?: number,
@@ -135,6 +179,8 @@ export interface TurnCallbacks {
   readonly onTurnSettled: () => void
   readonly getKnownRelayedNames: () => ReadonlySet<string>
   readonly nativeFlushGraceMs: number
+  readonly smoothStreaming?: boolean
+  readonly smoothIntervalMs?: number
 }
 
 export class ActiveTurn {
@@ -151,6 +197,11 @@ export class ActiveTurn {
   private partSeq = 0
   private flushTimer?: ReturnType<typeof setTimeout>
   private graceTimer?: ReturnType<typeof setTimeout>
+  private pacedKind?: "text" | "reasoning"
+  private pacedBlockId?: string
+  private pacedRemainder = ""
+  private pacedSliceChars = SMOOTH_MIN_SLICE_CHARS
+  private pacedTimer?: ReturnType<typeof setTimeout>
   private pausedForPending = false
   private contextUsed?: number
   private readonly completedTextBlocks: string[] = []
@@ -187,6 +238,95 @@ export class ActiveTurn {
     }
   }
 
+  private clearPacedTimer(): void {
+    if (this.pacedTimer) {
+      clearTimeout(this.pacedTimer)
+      this.pacedTimer = undefined
+    }
+  }
+
+  private flushPacedImmediate(): void {
+    this.clearPacedTimer()
+    const delta = this.pacedRemainder
+    const kind = this.pacedKind
+    const id = this.pacedBlockId
+    this.pacedRemainder = ""
+    this.pacedKind = undefined
+    this.pacedBlockId = undefined
+    if (delta.length > 0 && kind && id) {
+      this.emitPart({
+        type: kind === "reasoning" ? "reasoning-delta" : "text-delta",
+        id,
+        delta,
+      })
+    }
+  }
+
+  private scheduleNextPacedTick(): void {
+    this.clearPacedTimer()
+    const intervalMs = this.callbacks.smoothIntervalMs ?? DEFAULT_SMOOTH_INTERVAL_MS
+    this.pacedTimer = setTimeout(() => {
+      this.pacedTimer = undefined
+      if (!this.pacedRemainder || !this.pacedKind || !this.pacedBlockId) {
+        this.pacedRemainder = ""
+        this.pacedKind = undefined
+        this.pacedBlockId = undefined
+        return
+      }
+      if (!this.controller) {
+        this.flushPacedImmediate()
+        return
+      }
+      const [head, tail] = takeSmoothSlice(this.pacedRemainder, this.pacedSliceChars)
+      const kind = this.pacedKind
+      const id = this.pacedBlockId
+      this.pacedRemainder = tail
+      if (tail.length === 0) {
+        this.pacedKind = undefined
+        this.pacedBlockId = undefined
+      }
+      this.emitPart({
+        type: kind === "reasoning" ? "reasoning-delta" : "text-delta",
+        id,
+        delta: head,
+      })
+      if (tail.length > 0) {
+        this.scheduleNextPacedTick()
+      }
+    }, intervalMs)
+    this.pacedTimer.unref?.()
+  }
+
+  private emitPacedDelta(kind: "text" | "reasoning", id: string, text: string): void {
+    this.flushPacedImmediate()
+    if (!this.callbacks.smoothStreaming || !this.controller || text.length <= SMOOTH_MIN_CHUNK_CHARS) {
+      this.emitPart({
+        type: kind === "reasoning" ? "reasoning-delta" : "text-delta",
+        id,
+        delta: text,
+      })
+      return
+    }
+
+    const sliceChars = Math.max(
+      SMOOTH_MIN_SLICE_CHARS,
+      Math.ceil(text.length / SMOOTH_TARGET_TICKS),
+    )
+    const [head, tail] = takeSmoothSlice(text, sliceChars)
+    this.emitPart({
+      type: kind === "reasoning" ? "reasoning-delta" : "text-delta",
+      id,
+      delta: head,
+    })
+    if (tail.length > 0) {
+      this.pacedKind = kind
+      this.pacedBlockId = id
+      this.pacedRemainder = tail
+      this.pacedSliceChars = sliceChars
+      this.scheduleNextPacedTick()
+    }
+  }
+
   private clearTimers(): void {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer)
@@ -196,6 +336,7 @@ export class ActiveTurn {
       clearTimeout(this.graceTimer)
       this.graceTimer = undefined
     }
+    this.clearPacedTimer()
   }
 
   createBoundStream(
@@ -519,11 +660,7 @@ export class ActiveTurn {
           providerMetadata: { [PROVIDER_ID]: { acp: true } },
         })
       }
-      this.emitPart({
-        type: "reasoning-delta",
-        id: this.openReasoningId,
-        delta: text,
-      })
+      this.emitPacedDelta("reasoning", this.openReasoningId, text)
       return
     }
 
@@ -538,15 +675,7 @@ export class ActiveTurn {
         return
       }
 
-      if (this.openReasoningId) {
-        const rid = this.openReasoningId
-        this.openReasoningId = undefined
-        this.emitPart({
-          type: "reasoning-end",
-          id: rid,
-          providerMetadata: { [PROVIDER_ID]: { acp: true } },
-        })
-      }
+      this.closeOpenReasoning()
       if (!this.openTextId) {
         this.openTextId = `t_${++this.partSeq}`
         this.emitPart({
@@ -556,11 +685,7 @@ export class ActiveTurn {
         })
       }
       this.currentTextBuffer += text
-      this.emitPart({
-        type: "text-delta",
-        id: this.openTextId,
-        delta: text,
-      })
+      this.emitPacedDelta("text", this.openTextId, text)
       return
     }
 
@@ -703,6 +828,7 @@ export class ActiveTurn {
   }
 
   finishWithError(error: Error): void {
+    this.flushPacedImmediate()
     this.cancelPendingCalls(error.message)
     const ctrl = this.detachController()
     if (!ctrl) {
@@ -738,6 +864,7 @@ export class ActiveTurn {
     }
     this.currentTextBuffer = ""
     if (this.openTextId) {
+      this.flushPacedImmediate()
       const id = this.openTextId
       this.openTextId = undefined
       this.emitPart({
@@ -748,16 +875,20 @@ export class ActiveTurn {
     }
   }
 
+  private closeOpenReasoning(): void {
+    if (!this.openReasoningId) return
+    this.flushPacedImmediate()
+    const id = this.openReasoningId
+    this.openReasoningId = undefined
+    this.emitPart({
+      type: "reasoning-end",
+      id,
+      providerMetadata: { [PROVIDER_ID]: { acp: true } },
+    })
+  }
+
   private closeOpenBlocks(): void {
-    if (this.openReasoningId) {
-      const id = this.openReasoningId
-      this.openReasoningId = undefined
-      this.emitPart({
-        type: "reasoning-end",
-        id,
-        providerMetadata: { [PROVIDER_ID]: { acp: true } },
-      })
-    }
+    this.closeOpenReasoning()
     this.closeOpenText()
   }
 
@@ -772,6 +903,7 @@ export class ActiveTurn {
   }
 
   private detachController(): ReadableStreamDefaultController<LanguageModelV3StreamPart> | undefined {
+    this.clearPacedTimer()
     const ctrl = this.controller
     this.controller = undefined
     const cleanup = this.controllerCleanup
