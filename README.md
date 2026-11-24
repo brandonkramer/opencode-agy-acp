@@ -23,7 +23,7 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
 
 ```json
 {
-  "plugins": ["/path/to/opencode-agy-acp"],
+  "plugins": ["github:brandonkramer/opencode-agy-acp"],
   "providers": {
     "antigravity-acp": {
       "settings": {
@@ -90,33 +90,9 @@ bun test
 
 Requires OpenCode **2.4+** and the Google Antigravity CLI (`agy`) installed and signed in (`agy`).
 
-### Option 1: Install via OpenCode CLI (managed)
-
 ```sh
 opencode plugin add github:brandonkramer/opencode-agy-acp
 opencode reload
 ```
 
 Update later with `opencode plugin update`.
-
-### Option 2: Local checkout (recommended for development)
-
-```sh
-git clone https://github.com/brandonkramer/opencode-agy-acp.git
-cd opencode-agy-acp
-bun install
-```
-
-Add the checkout's absolute path to `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "plugins": ["/absolute/path/to/opencode-agy-acp"]
-}
-```
-
-Then reload OpenCode:
-
-```sh
-opencode reload
-```
