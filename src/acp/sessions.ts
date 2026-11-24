@@ -1,5 +1,6 @@
 import type { LanguageModelV3Prompt, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import type { Context } from "@opencode/plugin/effect/plugin"
+import type { Provider } from "@opencode/schema/provider"
 import type { Session } from "@opencode/schema/session"
 import { Effect, Semaphore } from "effect"
 import {
@@ -8,6 +9,7 @@ import {
   OPENCODE_QUESTION_TOOL,
   PROVIDER_ID,
   isRecord,
+  resolveSettings,
   type AcpDiscoveredModel,
   type AcpElicitationRequestParams,
   type AcpElicitationResponse,
@@ -17,6 +19,7 @@ import {
   type AcpSessionUpdate,
   type AgySettings,
   type CooldownBucket,
+  type RequestKind,
   type SessionDiagnostics,
   type SessionPublicState,
 } from "../types.js"
@@ -31,14 +34,14 @@ import {
 } from "./catalog.js"
 import {
   API_ERROR_ABORT_PATTERN,
-  buildTextOnlyHandoffPromptBlocks,
   buildThinAcpPromptBlocks,
   extractToolResultsFromPrompt,
-  hasUnseenNonAcpAssistantHistory,
   isGlobalBreakerError,
+  isLocalStatusMessage,
   isSyntheticRestartAfterError,
   quotaBucketForModel,
 } from "./history.js"
+import { buildSystemPromptAppend, hashSystemPrompt } from "./instructions.js"
 import {
   McpRelayServer,
   buildToolDescriptors,
@@ -46,6 +49,16 @@ import {
 } from "./mcp-relay.js"
 import { AcpProcess, type AgyIO } from "./process.js"
 import { elicitationToQuestions, parseQuestionToolAnswers } from "./question.js"
+import {
+  buildCheckpointPromptBlocks,
+  buildSavedHistory,
+  buildSideCallPromptBlocks,
+  decideSync,
+  fingerprintGroups,
+  parsePersistedRecord,
+  type PersistedSessionRecord,
+  type SyncDecision,
+} from "./sync.js"
 import { ActiveTurn, buildUsage } from "./turn.js"
 
 const STORAGE_KEY_PREFIX = "antigravity-acp:session:"
@@ -60,6 +73,8 @@ export interface SessionContextSnapshot {
   readonly tools: Record<string, { readonly description: string; readonly input: unknown }>
   readonly mcpSafeToOriginal: Map<string, string>
   readonly mcpDescriptors: McpToolDescriptor[]
+  readonly rawInstructions?: string
+  readonly systemPromptHash: string
 }
 
 interface Entry {
@@ -67,14 +82,18 @@ interface Entry {
   readonly lock: Semaphore.Semaphore
   cwd: string
   mode: AcpMode
+  modeExplicit: boolean
   codeModeEnabled: boolean
   codeModeExplicit: boolean
   acpSessionId?: string
   proc?: AcpProcess
   lastModelId?: string
   lastModeApplied?: AcpMode
+  lastAgent?: string
   lastError: string | null
   lastTitleSent?: string
+  lastSystemPromptHash?: string
+  persistedRecord?: PersistedSessionRecord
   contextSnapshot?: SessionContextSnapshot
   activeTurn?: ActiveTurn
   settlingPrompt?: Promise<void>
@@ -92,6 +111,7 @@ export interface SessionRegistryOptions {
 
 export class SessionRegistry {
   readonly mcpRelay: McpRelayServer
+  private baseSettings: AgySettings
   private readonly entries = new Map<string, Entry>()
   private readonly activeProcs = new Set<AcpProcess>()
   private readonly intentionallyDisposed = new WeakSet<AcpProcess>()
@@ -106,6 +126,7 @@ export class SessionRegistry {
     private readonly ctx: Context,
     private readonly options: SessionRegistryOptions,
   ) {
+    this.baseSettings = options.settings
     this.mcpRelay = new McpRelayServer({
       getTools: (sessionID) => this.entries.get(sessionID)?.contextSnapshot?.mcpDescriptors ?? [],
       callTool: (sessionID, toolName, args, signal) =>
@@ -114,7 +135,19 @@ export class SessionRegistry {
   }
 
   get settings(): AgySettings {
-    return this.options.settings
+    return this.baseSettings
+  }
+
+  updateBaseSettings(settings: AgySettings): void {
+    this.baseSettings = settings
+    for (const entry of this.entries.values()) {
+      if (!entry.codeModeExplicit) {
+        entry.codeModeEnabled = settings.codeMode
+      }
+      if (!entry.modeExplicit) {
+        entry.mode = entry.contextSnapshot?.agent === "plan" ? "plan" : settings.defaultMode
+      }
+    }
   }
 
   getModels(): readonly AcpDiscoveredModel[] {
@@ -132,8 +165,9 @@ export class SessionRegistry {
         sessionID,
         lock: Semaphore.makeUnsafe(1),
         cwd: this.ctx.location.directory,
-        mode: "auto",
-        codeModeEnabled: this.options.settings.codeMode,
+        mode: this.baseSettings.defaultMode,
+        modeExplicit: false,
+        codeModeEnabled: this.baseSettings.codeMode,
         codeModeExplicit: false,
         lastError: null,
         generation: 0,
@@ -141,6 +175,17 @@ export class SessionRegistry {
       this.entries.set(sessionID, entry)
     }
     return entry
+  }
+
+  private effectiveModeFor(
+    entry: Entry,
+    runtimeSettings: AgySettings,
+    agentOverride?: string,
+  ): AcpMode {
+    if (entry.modeExplicit) return entry.mode
+    const agent = agentOverride ?? entry.lastAgent ?? entry.contextSnapshot?.agent
+    if (agent === "plan") return "plan"
+    return runtimeSettings.defaultMode
   }
 
   private clearIdleTimer(entry: Entry): void {
@@ -157,7 +202,7 @@ export class SessionRegistry {
     // Never reap while a turn is active or parked waiting on OpenCode tools/questions.
     if (entry.activeTurn || !entry.proc || entry.proc.isClosed) return
 
-    const idleMs = this.options.settings.idleTimeoutMs
+    const idleMs = this.baseSettings.idleTimeoutMs
     if (idleMs <= 0) return
     entry.idleTimer = setTimeout(() => {
       entry.idleTimer = undefined
@@ -192,6 +237,7 @@ export class SessionRegistry {
       entry.acpToolsSignature = undefined
       entry.lastModelId = undefined
       entry.lastModeApplied = undefined
+      entry.lastSystemPromptHash = undefined
     }
     entry.settlingPrompt = undefined
     if (!proc) return
@@ -240,9 +286,25 @@ export class SessionRegistry {
 
     if (!this.catalogDiscoveryPromise) {
       this.catalogDiscoveryPromise = (async () => {
+        if (this.ctx.provider?.get) {
+          try {
+            const info = await Effect.runPromise(
+              this.ctx.provider.get({ providerID: PROVIDER_ID as Provider.ID }).pipe(Effect.option),
+            )
+            if (info._tag === "Some") {
+              this.updateBaseSettings(
+                resolveSettings(
+                  info.value.data as unknown as Record<string, unknown>,
+                  process.env,
+                  this.baseSettings,
+                ),
+              )
+            }
+          } catch {}
+        }
         const discovered = await discoverAcpModels(
           this.ctx.location.directory,
-          this.options.settings,
+          this.baseSettings,
           this.options.io,
         )
         const normalized = normalizeCatalog(discovered)
@@ -280,9 +342,14 @@ export class SessionRegistry {
     input: {
       readonly agent: string
       readonly tools: Record<string, { readonly description: string; readonly input: unknown }>
+      readonly rawInstructions?: string
     },
   ): void {
     const entry = this.getOrCreateEntry(sessionID)
+    if (!entry.modeExplicit) {
+      entry.mode = input.agent === "plan" ? "plan" : this.baseSettings.defaultMode
+    }
+    const systemPromptHash = hashSystemPrompt(input.rawInstructions)
     const toolSignature = Object.entries(input.tools)
       .map(([name, info]) => {
         let schema: string
@@ -297,7 +364,12 @@ export class SessionRegistry {
       .join("\0")
 
     const prev = entry.contextSnapshot
-    if (prev && prev.agent === input.agent && prev.toolSignature === toolSignature) {
+    if (
+      prev &&
+      prev.agent === input.agent &&
+      prev.toolSignature === toolSignature &&
+      prev.systemPromptHash === systemPromptHash
+    ) {
       return
     }
     const { mcpDescriptors, mcpSafeToOriginal } = entry.codeModeEnabled
@@ -310,6 +382,8 @@ export class SessionRegistry {
       tools: input.tools,
       mcpDescriptors,
       mcpSafeToOriginal,
+      rawInstructions: input.rawInstructions,
+      systemPromptHash,
     }
   }
 
@@ -389,8 +463,8 @@ export class SessionRegistry {
     const entry = this.entries.get(sessionID)
     return {
       sessionID,
-      mode: entry?.mode ?? "auto",
-      codeModeEnabled: entry?.codeModeEnabled ?? this.options.settings.codeMode,
+      mode: entry ? this.effectiveModeFor(entry, this.baseSettings) : this.baseSettings.defaultMode,
+      codeModeEnabled: entry?.codeModeEnabled ?? this.baseSettings.codeMode,
       starting: false,
       acpSessionId: entry?.acpSessionId ?? null,
       connected: Boolean(entry?.proc && !entry.proc.isClosed && entry.acpSessionId),
@@ -407,8 +481,8 @@ export class SessionRegistry {
     return {
       sessionID,
       acpSessionId: entry?.acpSessionId ?? null,
-      mode: entry?.mode ?? "auto",
-      codeModeEnabled: entry?.codeModeEnabled ?? this.options.settings.codeMode,
+      mode: entry ? this.effectiveModeFor(entry, this.baseSettings) : this.baseSettings.defaultMode,
+      codeModeEnabled: entry?.codeModeEnabled ?? this.baseSettings.codeMode,
       connected: Boolean(entry?.proc && !entry.proc.isClosed && entry.acpSessionId),
       busy: Boolean(entry?.activeTurn),
       watchdogPaused: entry?.proc?.isWatchdogPaused ?? false,
@@ -425,6 +499,7 @@ export class SessionRegistry {
       entry.lock.withPermit(
         Effect.promise(async () => {
           entry.mode = mode
+          entry.modeExplicit = true
           if (entry.proc && !entry.proc.isClosed && entry.acpSessionId) {
             try {
               await entry.proc.setMode(entry.acpSessionId, mode)
@@ -519,7 +594,7 @@ export class SessionRegistry {
         () => false,
       ),
       new Promise<true>((resolve) => {
-        timer = setTimeout(() => resolve(true), this.options.settings.settleTimeoutMs)
+        timer = setTimeout(() => resolve(true), this.baseSettings.settleTimeoutMs)
         timer.unref?.()
       }),
     ])
@@ -540,26 +615,37 @@ export class SessionRegistry {
     entry.acpToolsSignature = undefined
     entry.lastModelId = undefined
     entry.lastModeApplied = undefined
+    entry.lastSystemPromptHash = undefined
+    entry.persistedRecord = undefined
     entry.lastError = null
     await this.runStorageRemove(entry.sessionID)
   }
 
-  private async runStorageGet(sessionID: string): Promise<string | undefined> {
+  private async runStorageGetRecord(sessionID: string): Promise<PersistedSessionRecord | undefined> {
+    const entry = this.entries.get(sessionID)
+    if (entry?.persistedRecord) return entry.persistedRecord
     try {
       const val = await Effect.runPromise(this.ctx.storage.get(`${STORAGE_KEY_PREFIX}${sessionID}`))
-      return typeof val === "string" && val.length > 0 ? val : undefined
+      const parsed = parsePersistedRecord(val)
+      if (parsed && entry) entry.persistedRecord = parsed
+      return parsed
     } catch {
       return undefined
     }
   }
 
-  private async runStorageSet(sessionID: string, acpSessionId: string): Promise<void> {
+  private async runStorageSetRecord(entry: Entry, record: PersistedSessionRecord): Promise<void> {
+    entry.persistedRecord = record
     try {
-      await Effect.runPromise(this.ctx.storage.set(`${STORAGE_KEY_PREFIX}${sessionID}`, acpSessionId))
+      await Effect.runPromise(
+        this.ctx.storage.set(`${STORAGE_KEY_PREFIX}${entry.sessionID}`, JSON.stringify(record)),
+      )
     } catch {}
   }
 
   private async runStorageRemove(sessionID: string): Promise<void> {
+    const entry = this.entries.get(sessionID)
+    if (entry) entry.persistedRecord = undefined
     try {
       await Effect.runPromise(this.ctx.storage.remove(`${STORAGE_KEY_PREFIX}${sessionID}`))
     } catch {}
@@ -568,6 +654,11 @@ export class SessionRegistry {
   private async ensureAcpSessionLocked(
     entry: Entry,
     runtimeSettings: AgySettings,
+    options?: {
+      readonly recorded?: PersistedSessionRecord
+      readonly systemPromptAppend?: string
+      readonly systemPromptHash?: string
+    },
   ): Promise<{ proc: AcpProcess; acpSessionId: string; freshSession: boolean }> {
     try {
       const info = await Effect.runPromise(
@@ -594,6 +685,10 @@ export class SessionRegistry {
         ]
       : []
 
+    const systemPromptAppend = options?.systemPromptAppend
+    const systemPromptHash = options?.systemPromptHash
+    const recorded = options?.recorded
+
     // Reuse live proc + session if alive and tool signature matches.
     if (entry.proc && !entry.proc.isClosed && entry.acpSessionId) {
       if (entry.acpToolsSignature === this.acpToolsSignatureFor(entry)) {
@@ -605,6 +700,7 @@ export class SessionRegistry {
         const res = await entry.proc.newSession({
           cwd: entry.cwd,
           mcpServers,
+          systemPromptAppend,
           timeoutMs: runtimeSettings.startupTimeoutMs,
         })
         if (!res.sessionId) throw new Error("Empty sessionId from refreshed ACP session")
@@ -612,11 +708,19 @@ export class SessionRegistry {
         entry.acpToolsSignature = this.acpToolsSignatureFor(entry)
         entry.lastModelId = undefined
         entry.lastModeApplied = undefined
-        if (entry.mode !== "default") {
-          await entry.proc.setMode(entry.acpSessionId, entry.mode).catch(() => {})
-          entry.lastModeApplied = entry.mode
+        entry.lastSystemPromptHash = systemPromptHash
+        const desiredMode = this.effectiveModeFor(entry, runtimeSettings)
+        if (desiredMode !== "default") {
+          await entry.proc.setMode(entry.acpSessionId, desiredMode).catch(() => {})
+          entry.lastModeApplied = desiredMode
         }
-        await this.runStorageSet(entry.sessionID, entry.acpSessionId)
+        await this.runStorageSetRecord(entry, {
+          version: 1,
+          acpSessionId: entry.acpSessionId,
+          turns: recorded?.turns ?? entry.persistedRecord?.turns ?? [],
+          ...(entry.lastModelId ? { lastModelId: entry.lastModelId } : {}),
+          ...(systemPromptHash ? { lastSystemPromptHash: systemPromptHash } : {}),
+        })
         return { proc: entry.proc, acpSessionId: entry.acpSessionId, freshSession: true }
       } catch {
         await this.disposeEntryProc(entry, { clearSessionId: true })
@@ -653,7 +757,7 @@ export class SessionRegistry {
       }
     }
 
-    const storedId = entry.acpSessionId ?? (await this.runStorageGet(entry.sessionID))
+    const storedId = entry.acpSessionId ?? recorded?.acpSessionId
     let res: Awaited<ReturnType<AcpProcess["newSession"]>> | undefined
     let freshSession = false
     if (storedId) {
@@ -662,6 +766,7 @@ export class SessionRegistry {
           sessionId: storedId,
           cwd: entry.cwd,
           mcpServers,
+          systemPromptAppend,
           timeoutMs: runtimeSettings.startupTimeoutMs,
         })
       } catch {
@@ -673,6 +778,7 @@ export class SessionRegistry {
       res = await proc.newSession({
         cwd: entry.cwd,
         mcpServers,
+        systemPromptAppend,
         timeoutMs: runtimeSettings.startupTimeoutMs,
       })
     }
@@ -687,7 +793,14 @@ export class SessionRegistry {
     entry.acpSessionId = String(res.sessionId)
     entry.acpToolsSignature = this.acpToolsSignatureFor(entry)
     entry.lastError = null
-    await this.runStorageSet(entry.sessionID, entry.acpSessionId)
+    entry.lastSystemPromptHash = systemPromptHash
+    await this.runStorageSetRecord(entry, {
+      version: 1,
+      acpSessionId: entry.acpSessionId,
+      turns: freshSession ? [] : (recorded?.turns ?? []),
+      ...(entry.lastModelId ? { lastModelId: entry.lastModelId } : {}),
+      ...(systemPromptHash ? { lastSystemPromptHash: systemPromptHash } : {}),
+    })
 
     if (res.models?.availableModels?.length || res.configOptions?.length) {
       const live = normalizeCatalog(buildModelCatalog(res))
@@ -700,9 +813,10 @@ export class SessionRegistry {
       }
     }
 
-    if (entry.mode !== "default") {
-      await proc.setMode(entry.acpSessionId, entry.mode).catch(() => {})
-      entry.lastModeApplied = entry.mode
+    const desiredMode = this.effectiveModeFor(entry, runtimeSettings)
+    if (desiredMode !== "default") {
+      await proc.setMode(entry.acpSessionId, desiredMode).catch(() => {})
+      entry.lastModeApplied = desiredMode
     }
     return { proc, acpSessionId: entry.acpSessionId, freshSession }
   }
@@ -757,7 +871,7 @@ export class SessionRegistry {
     const proc = entry.proc
     proc?.pauseWatchdog()
     try {
-      const timeoutMs = this.options.settings.permissionTimeoutMs
+      const timeoutMs = this.baseSettings.permissionTimeoutMs
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined
       const timedOut = await Promise.race([
         Effect.runPromise(
@@ -861,6 +975,7 @@ export class SessionRegistry {
     entry.acpToolsSignature = undefined
     entry.lastModelId = undefined
     entry.lastModeApplied = undefined
+    entry.lastSystemPromptHash = undefined
     entry.settlingPrompt = undefined
     if (entry.activeTurn) {
       const turn = entry.activeTurn
@@ -897,6 +1012,8 @@ export class SessionRegistry {
     readonly sessionID: string
     readonly modelID: string
     readonly variant?: string
+    readonly requestKind?: RequestKind
+    readonly agent?: string
     readonly prompt: LanguageModelV3Prompt
     readonly abortSignal?: AbortSignal
     readonly runtimeSettings?: AgySettings
@@ -908,9 +1025,21 @@ export class SessionRegistry {
       )
     }
 
+    if (input.requestKind === "compaction" || input.requestKind === "generate") {
+      return this.runSideCall({
+        sessionID: input.sessionID,
+        modelID: input.modelID,
+        variant: input.variant,
+        requestKind: input.requestKind,
+        prompt: input.prompt,
+        abortSignal: input.abortSignal,
+        runtimeSettings: input.runtimeSettings,
+      })
+    }
+
     const entry = this.getOrCreateEntry(input.sessionID)
     this.clearIdleTimer(entry)
-    const runtimeSettings = input.runtimeSettings ?? this.options.settings
+    const runtimeSettings = input.runtimeSettings ?? this.baseSettings
     if (!entry.codeModeExplicit && runtimeSettings.codeMode !== entry.codeModeEnabled) {
       entry.codeModeEnabled = runtimeSettings.codeMode
     }
@@ -943,11 +1072,17 @@ export class SessionRegistry {
       )
     }
 
+    const groups = fingerprintGroups(input.prompt)
+    const nonSystem = input.prompt.filter((m) => m.role !== "system" && !isLocalStatusMessage(m))
+    const lastIsUser = nonSystem.at(-1)?.role === "user"
+    const priorGroups = lastIsUser ? groups.slice(0, -1) : groups
+    const currentUserMsg = lastIsUser ? groups.at(-1)?.userMessage : undefined
+
     let prepared: {
       readonly proc: AcpProcess
       readonly acpSessionId: string
-      readonly freshSession: boolean
-      readonly needsHandoff: boolean
+      readonly syncDecision: SyncDecision
+      readonly systemPromptHash: string
       readonly turnGeneration: number
     }
     try {
@@ -965,12 +1100,46 @@ export class SessionRegistry {
               throw new Error(`COOLDOWN:${postSettleCooldown.until}:${postSettleCooldown.reason}`)
             }
 
-            const needsHandoff = hasUnseenNonAcpAssistantHistory(input.prompt)
-            if (needsHandoff) {
+            const recorded = await this.runStorageGetRecord(entry.sessionID)
+            const hasLiveOrResumableAcpSession = Boolean(entry.acpSessionId ?? recorded?.acpSessionId)
+            let syncDecision = decideSync({
+              recorded,
+              priorGroups,
+              hasLiveOrResumableAcpSession,
+            })
+
+            if (syncDecision.kind === "diverged") {
               await this.softResetForHandoffLocked(entry)
+              syncDecision =
+                priorGroups.length > 0
+                  ? { kind: "fresh-with-history", priorGroups }
+                  : { kind: "fresh" }
             }
 
-            const ensured = await this.ensureAcpSessionLocked(entry, runtimeSettings)
+            const systemPromptAppend = buildSystemPromptAppend({
+              rawInstructions: entry.contextSnapshot?.rawInstructions,
+              forwardInstructions: runtimeSettings.forwardInstructions,
+            })
+            const systemPromptHash = hashSystemPrompt(systemPromptAppend)
+
+            const ensured = await this.ensureAcpSessionLocked(entry, runtimeSettings, {
+              recorded:
+                syncDecision.kind === "fresh" || syncDecision.kind === "fresh-with-history"
+                  ? undefined
+                  : recorded,
+              systemPromptAppend,
+              systemPromptHash,
+            })
+            if (
+              ensured.freshSession &&
+              (syncDecision.kind === "continue" || syncDecision.kind === "catch-up")
+            ) {
+              syncDecision =
+                priorGroups.length > 0
+                  ? { kind: "fresh-with-history", priorGroups }
+                  : { kind: "fresh" }
+            }
+
             const target = resolveAcpModelTarget(this.catalog, input.modelID, input.variant)
             if (entry.lastModelId !== target.acpModelId) {
               try {
@@ -988,11 +1157,24 @@ export class SessionRegistry {
               entry.lastModelId = target.acpModelId
             }
 
+            const desiredMode = this.effectiveModeFor(entry, runtimeSettings, input.agent)
+            if (input.agent) entry.lastAgent = input.agent
+            if (!entry.modeExplicit) {
+              entry.mode = desiredMode
+            }
+            if (
+              entry.lastModeApplied !== desiredMode &&
+              (desiredMode !== "default" || entry.lastModeApplied !== undefined)
+            ) {
+              await ensured.proc.setMode(ensured.acpSessionId, desiredMode).catch(() => {})
+              entry.lastModeApplied = desiredMode
+            }
+
             return {
               proc: ensured.proc,
               acpSessionId: ensured.acpSessionId,
-              freshSession: ensured.freshSession,
-              needsHandoff,
+              syncDecision,
+              systemPromptHash,
               turnGeneration: entry.generation,
             }
           }),
@@ -1016,12 +1198,39 @@ export class SessionRegistry {
       throw err
     }
 
-    const { proc, acpSessionId, freshSession, needsHandoff, turnGeneration } = prepared
-    const nonSystemTurnCount = input.prompt.filter((m) => m.role !== "system").length
+    const { proc, acpSessionId, syncDecision, systemPromptHash, turnGeneration } = prepared
     const promptBlocks =
-      needsHandoff || (freshSession && nonSystemTurnCount > 1)
-        ? buildTextOnlyHandoffPromptBlocks(input.prompt, { maxChars: 16_000 })
-        : buildThinAcpPromptBlocks(input.prompt)
+      syncDecision.kind === "catch-up"
+        ? buildCheckpointPromptBlocks({
+            groups: syncDecision.unseenGroups,
+            currentUserMessage: currentUserMsg,
+            mode: "catch-up",
+          })
+        : syncDecision.kind === "fresh-with-history"
+          ? buildCheckpointPromptBlocks({
+              groups: syncDecision.priorGroups,
+              currentUserMessage: currentUserMsg,
+              mode: "restore",
+            })
+          : buildThinAcpPromptBlocks(input.prompt)
+
+    let recordPersisted = false
+    const persistTurnRecord = () => {
+      if (recordPersisted || this.disposed || entry.generation !== turnGeneration) return
+      recordPersisted = true
+      const turns = buildSavedHistory({
+        priorGroups,
+        currentUserMessage: currentUserMsg,
+        assistantTextBlocks: turn.assistantTextBlocks,
+      })
+      void this.runStorageSetRecord(entry, {
+        version: 1,
+        acpSessionId,
+        turns,
+        ...(entry.lastModelId ? { lastModelId: entry.lastModelId } : {}),
+        ...(systemPromptHash ? { lastSystemPromptHash: systemPromptHash } : {}),
+      })
+    }
 
     const turn = new ActiveTurn({
       pauseWatchdog: () => proc.pauseWatchdog(),
@@ -1033,6 +1242,9 @@ export class SessionRegistry {
         void this.handleInterrupt(input.sessionID, reason)
       },
       onTurnSettled: () => {
+        if (!turn.promptError && !turn.abortedOnApiError) {
+          persistTurnRecord()
+        }
         if (entry.activeTurn === turn) entry.activeTurn = undefined
         this.notifyChanged(input.sessionID)
       },
@@ -1064,6 +1276,7 @@ export class SessionRegistry {
           turn.promptResult = res
           entry.lastError = null
           if (turn.dispatchedCallIds.size === 0 && turn.hasController) {
+            persistTurnRecord()
             turn.finalizeStop()
             if (entry.activeTurn === turn) entry.activeTurn = undefined
             this.notifyChanged(input.sessionID)
@@ -1095,6 +1308,160 @@ export class SessionRegistry {
     })
   }
 
+  private async runSideCall(input: {
+    readonly sessionID: string
+    readonly modelID: string
+    readonly variant?: string
+    readonly requestKind: "compaction" | "generate"
+    readonly prompt: LanguageModelV3Prompt
+    readonly abortSignal?: AbortSignal
+    readonly runtimeSettings?: AgySettings
+  }): Promise<ReadableStream<LanguageModelV3StreamPart>> {
+    await this.loadPersistedCooldown()
+    const cooldown = this.cooldownForModel(input.modelID)
+    if (cooldown) {
+      const secs = Math.ceil((cooldown.until - Date.now()) / 1000)
+      return this.createImmediateTextStream(
+        `Antigravity ACP cooldown active (${secs}s remaining) after upstream API error (${cooldown.reason}) to protect your account from retry loops.`,
+        "circuit_open",
+      )
+    }
+
+    const runtimeSettings = input.runtimeSettings ?? this.baseSettings
+    const entry = this.entries.get(input.sessionID)
+    let cwd = entry?.cwd ?? this.ctx.location.directory
+    if (!entry) {
+      try {
+        const info = await Effect.runPromise(
+          this.ctx.session.get({ sessionID: input.sessionID as Session.ID }),
+        )
+        if (info?.location?.directory) cwd = info.location.directory
+      } catch {}
+    }
+
+    let proc: AcpProcess | undefined
+    let sideSessionId: string | undefined
+    let cleanedUp = false
+    const cleanup = () => {
+      if (cleanedUp) return
+      cleanedUp = true
+      if (!proc) return
+      const targetProc = proc
+      this.intentionallyDisposed.add(targetProc)
+      this.activeProcs.delete(targetProc)
+      if (!targetProc.isClosed && sideSessionId) {
+        targetProc.notifyCancel(sideSessionId)
+      }
+      void targetProc.dispose().catch(() => {})
+    }
+
+    const turn = new ActiveTurn({
+      pauseWatchdog: () => proc?.pauseWatchdog(),
+      resumeWatchdog: () => proc?.resumeWatchdog(),
+      nativeFlushGraceMs: runtimeSettings.nativeFlushGraceMs,
+      getKnownRelayedNames: () => new Set<string>(),
+      onInterruptRequested: (reason) => {
+        cleanup()
+        turn.finishWithError(new Error(reason))
+      },
+      onTurnSettled: () => cleanup(),
+      onApiErrorText: (text) => {
+        if (isGlobalBreakerError(text)) {
+          this.tripCircuitBreaker(text, "global")
+        } else {
+          this.tripCircuitBreaker(text, quotaBucketForModel(input.modelID))
+        }
+        cleanup()
+        turn.finishCleanStop(
+          `Antigravity ACP halted side call on upstream error:\n${text.trim()}`,
+          "api_error_halted",
+          true,
+        )
+      },
+    })
+
+    proc = new AcpProcess({
+      cwd,
+      binaryPath: runtimeSettings.binaryPath,
+      processPerSession: false,
+      includeDefaultCustomizations: runtimeSettings.includeDefaultCustomizations,
+      dangerouslySkipPermissions: false,
+      extraDirs: runtimeSettings.extraDirs,
+      traceLogPath: runtimeSettings.traceLogPath,
+      io: this.options.io,
+      onUpdate: (_sid, update) => turn.handleUpdate(update),
+      onExit: (code, signal, tail) => {
+        if (proc) this.activeProcs.delete(proc)
+        if (cleanedUp || this.disposed || (proc && this.intentionallyDisposed.has(proc))) return
+        const lastLine = tail.split("\n").filter(Boolean).at(-1)
+        turn.finishWithError(
+          new Error(`agy acp exited during ${input.requestKind} (code=${code}, signal=${signal})${lastLine ? `: ${lastLine}` : ""}`),
+        )
+      },
+    })
+    this.activeProcs.add(proc)
+
+    try {
+      await proc.initialize(runtimeSettings.startupTimeoutMs)
+      await proc.authenticate(runtimeSettings.startupTimeoutMs)
+      const res = await proc.newSession({
+        cwd,
+        mcpServers: [],
+        timeoutMs: runtimeSettings.startupTimeoutMs,
+      })
+      if (!res.sessionId) {
+        throw new Error(`Antigravity ACP did not return a sessionId for ${input.requestKind}`)
+      }
+      sideSessionId = String(res.sessionId)
+      const target = resolveAcpModelTarget(this.catalog, input.modelID, input.variant)
+      try {
+        await proc.setModel(sideSessionId, target.acpModelId)
+      } catch {
+        await proc.setConfigOption(sideSessionId, "model", target.baseModelId).catch(() => {})
+        if (target.thoughtLevel) {
+          await proc
+            .setConfigOption(sideSessionId, "thought_level", target.thoughtLevel)
+            .catch(() => {})
+        }
+      }
+    } catch (err) {
+      cleanup()
+      if (err instanceof AgyNotFoundError || (err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return this.createImmediateTextStream(err instanceof Error ? err.message : String(err), "agy_unavailable")
+      }
+      throw err
+    }
+
+    const activeProc = proc
+    const activeSid = sideSessionId
+    const promptBlocks = buildSideCallPromptBlocks(input.prompt, input.requestKind)
+
+    return turn.createBoundStream(input.abortSignal, () => {
+      activeProc
+        .prompt(activeSid, promptBlocks, {
+          idleWatchdogMs: runtimeSettings.chunkTimeoutMs,
+        })
+        .then(async (res) => {
+          if (turn.abortedOnApiError || this.disposed) return
+          turn.promptSettled = true
+          turn.promptResult = res
+          await activeProc.closeSession(activeSid).catch(() => undefined)
+          cleanup()
+          if (turn.hasController) {
+            turn.finalizeStop()
+          }
+        })
+        .catch((err) => {
+          if (turn.abortedOnApiError || this.disposed) return
+          turn.promptSettled = true
+          const error = err instanceof Error ? err : new Error(String(err))
+          turn.promptError = error
+          cleanup()
+          turn.finishWithError(error)
+        })
+    })
+  }
+
   private async recoverStalledProc(
     entry: Entry,
     proc: AcpProcess,
@@ -1118,7 +1485,7 @@ export class SessionRegistry {
     await this.runStorageRemove(entry.sessionID)
     // Give the child a brief window to observe session/cancel before SIGTERM/SIGKILL.
     await new Promise<void>((resolve) => {
-      const t = setTimeout(resolve, Math.min(this.options.settings.settleTimeoutMs, 100))
+      const t = setTimeout(resolve, Math.min(this.baseSettings.settleTimeoutMs, 100))
       t.unref?.()
     })
     proc.killImmediate()

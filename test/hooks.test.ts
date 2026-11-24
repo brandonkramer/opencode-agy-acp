@@ -253,6 +253,154 @@ describe("Plugin.define hook wiring (src/index.ts)", () => {
       const sdkEvt = { model: reg!.models[0], package: PACKAGE_ID, options: {}, sdk: undefined as unknown }
       await Effect.runPromise(sdkHook!(sdkEvt))
       expect(typeof (sdkEvt.sdk as { languageModel: unknown }).languageModel).toBe("function")
+
+      // 8. compaction and generate hooks sanitize messages, clear tools, and preserve system prompts
+      const compactionHook = sessionHooks.get("compaction")?.[0]
+      const generateHook = sessionHooks.get("generate")?.[0]
+      expect(compactionHook).toBeDefined()
+      expect(generateHook).toBeDefined()
+
+      const sideCtx: SessionContext = {
+        ...acpContext,
+        system: [{ type: "text", text: "Keep summary short" } as never],
+        tools: { bash: { description: "Run shell", input: {} } },
+      }
+      await Effect.runPromise(compactionHook!(sideCtx))
+      expect(sideCtx.system).toEqual([{ type: "text", text: "Keep summary short" } as never])
+      expect(sideCtx.tools).toEqual({})
+    } finally {
+      await Effect.runPromise(Scope.close(scope, Option.none() as never))
+    }
+  })
+
+  test("preserves existing providers.antigravity-acp.settings across transform and reads effective settings", async () => {
+    const store = new Map<string, unknown>()
+    const providers = new Map<string, { info: Provider.Info; models: readonly Model.Info[] }>()
+    const sessionHooks = new Map<string, Array<(input: unknown) => Effect.Effect<void>>>()
+    let registeredRpc: Record<string, (input: unknown) => Effect.Effect<unknown>> | undefined
+
+    // Pre-seed provider entry as OpenCode config loader does before plugin transform runs.
+    providers.set(PROVIDER_ID, {
+      info: {
+        id: PROVIDER_ID as Provider.ID,
+        name: "Antigravity (ACP)",
+        package: PACKAGE_ID,
+        activation: "enabled",
+        settings: {
+          defaultMode: "accept-edits",
+          forwardInstructions: false,
+          codeMode: true,
+        } as never,
+      } as Provider.Info,
+      models: [],
+    })
+
+    store.set("antigravity-acp:model-catalog:v1", {
+      version: 1,
+      updatedAt: Date.now(),
+      models: [
+        {
+          id: "gemini-4-neon",
+          name: "Gemini 4 Neon",
+          family: "gemini-4-neon",
+          defaultAcpModelId: "gemini-4-neon-high",
+          variants: [{ id: "high", acpModelId: "gemini-4-neon-high", thoughtLevel: "high" }],
+        },
+      ],
+    })
+
+    const mockCtx = {
+      location: { directory: process.cwd() },
+      storage: {
+        get: (key: string) => Effect.sync(() => store.get(key) as never),
+        set: (key: string, value: unknown) =>
+          Effect.sync(() => {
+            store.set(key, value)
+          }),
+        remove: (key: string) =>
+          Effect.sync(() => {
+            store.delete(key)
+          }),
+      },
+      agent: {
+        get: () => Effect.succeed({ data: { system: "Role instructions from agent" } } as never),
+      },
+      provider: {
+        get: () => {
+          const entry = providers.get(PROVIDER_ID)
+          return entry
+            ? Effect.succeed({ data: entry.info } as never)
+            : Effect.fail(new Error("not found") as never)
+        },
+        reload: () => Effect.void,
+        transform: (fn: (editor: ProviderEditor) => void) =>
+          Effect.sync(() => {
+            const editor: ProviderEditor = {
+              list: () => [],
+              get: (id) => {
+                const entry = providers.get(id)
+                if (!entry) return undefined
+                return {
+                  provider: entry.info,
+                  models: new Map(entry.models.map((m) => [m.id, m])),
+                }
+              },
+              add: (input) => {
+                providers.set(input.info.id, { info: input.info, models: input.models })
+              },
+              update: () => {},
+              remove: (id) => {
+                providers.delete(id)
+              },
+              models: {
+                set: () => {},
+                update: () => {},
+                remove: () => {},
+              },
+            }
+            fn(editor)
+          }),
+      },
+      aisdk: { hook: () => Effect.void },
+      session: {
+        get: () => Effect.succeed({ location: { directory: process.cwd() } } as never),
+        update: () => Effect.void,
+        hook: (name: string, fn: (input: unknown) => Effect.Effect<void>) =>
+          Effect.sync(() => {
+            const list = sessionHooks.get(name) ?? []
+            list.push(fn)
+            sessionHooks.set(name, list)
+          }),
+      },
+      permission: { assert: () => Effect.void },
+      rpc: {
+        register: (
+          _def: unknown,
+          handlers: Record<string, (input: unknown) => Effect.Effect<unknown>>,
+        ) =>
+          Effect.sync(() => {
+            registeredRpc = handlers
+            return { events: { emit: () => Effect.void } } as never
+          }),
+      },
+      event: { subscribe: () => Stream.empty },
+    } as unknown as Context
+
+    const scope = Effect.runSync(Scope.make())
+    try {
+      await Effect.runPromise(plugin.effect(mockCtx).pipe(Scope.provide(scope)))
+      const transformed = providers.get(PROVIDER_ID)
+      expect(transformed?.info.settings).toEqual({
+        defaultMode: "accept-edits",
+        forwardInstructions: false,
+        codeMode: true,
+      })
+
+      const state = (await Effect.runPromise(
+        registeredRpc!.getState({ sessionID: "ses_preserved" }),
+      )) as { mode: string; codeModeEnabled: boolean }
+      expect(state.mode).toBe("accept-edits")
+      expect(state.codeModeEnabled).toBe(true)
     } finally {
       await Effect.runPromise(Scope.close(scope, Option.none() as never))
     }

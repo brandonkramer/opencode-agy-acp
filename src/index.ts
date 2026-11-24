@@ -1,10 +1,13 @@
 import { Model, Plugin, Provider } from "@opencode/plugin/effect"
-import { Effect, Stream } from "effect"
+import type { SessionContext } from "@opencode/plugin/effect/session"
+import type { Agent } from "@opencode/schema/agent"
+import { Effect, Option, Stream } from "effect"
 import {
   sanitizeForAcpModel,
   sanitizeForNonAcpModel,
   summarizeTitleFromMessages,
 } from "./acp/history.js"
+import { extractOpenCodeInstructions } from "./acp/instructions.js"
 import { SessionRegistry } from "./acp/sessions.js"
 import { createAgyLanguageModel } from "./language-model.js"
 import { AcpRpc } from "./rpc.js"
@@ -69,13 +72,30 @@ export default Plugin.define({
       const cacheStatus = yield* Effect.promise(() => registry.loadCachedModels())
 
       yield* ctx.provider.transform((editor) => {
-        if (editor.get(providerID)) {
+        const existing = editor.get(providerID)
+        if (existing?.provider) {
+          registry.updateBaseSettings(
+            resolveSettings(
+              existing.provider as unknown as Record<string, unknown>,
+              process.env,
+              registry.settings,
+            ),
+          )
+        }
+        if (existing) {
           editor.remove(providerID)
         }
         const info = Provider.Info.empty(providerID)
         editor.add({
           info: {
             ...info,
+            ...(existing?.provider
+              ? {
+                  settings: existing.provider.settings,
+                  headers: existing.provider.headers,
+                  body: existing.provider.body,
+                }
+              : {}),
             name: "Antigravity (ACP)",
             activation: "enabled",
             package: PACKAGE_ID,
@@ -84,11 +104,21 @@ export default Plugin.define({
         })
       })
 
+      const postTransformInfo = yield* ctx.provider.get({ providerID }).pipe(Effect.option)
+      const effectiveSettings = resolveSettings(
+        postTransformInfo._tag === "Some"
+          ? (postTransformInfo.value.data as unknown as Record<string, unknown>)
+          : undefined,
+        process.env,
+        initialSettings,
+      )
+      registry.updateBaseSettings(effectiveSettings)
+
       yield* ctx.aisdk.hook(
         "sdk",
         (input) =>
           Effect.sync(() => {
-            const runtimeSettings = resolveSettings(input.options)
+            const runtimeSettings = resolveSettings(input.options, process.env, registry.settings)
             input.sdk = {
               languageModel: (id: string) =>
                 createAgyLanguageModel(id, registry, runtimeSettings),
@@ -101,7 +131,7 @@ export default Plugin.define({
         "language",
         (input) =>
           Effect.sync(() => {
-            const runtimeSettings = resolveSettings(input.options)
+            const runtimeSettings = resolveSettings(input.options, process.env, registry.settings)
             const id = String(input.model.modelID ?? input.model.id)
             input.language = createAgyLanguageModel(id, registry, runtimeSettings)
           }),
@@ -109,26 +139,55 @@ export default Plugin.define({
       )
 
       yield* ctx.session.hook("context", (input) =>
-        Effect.sync(() => {
-          if (input.model.providerID === providerID) {
-            sanitizeForAcpModel(input.messages)
-            registry.updateContextSnapshot(input.sessionID, {
-              agent: input.agent,
-              tools: input.tools,
-            })
-            // Thin ACP: clear outer system instructions so agy owns its system prompt.
-            input.system = []
-            const state = registry.getState(input.sessionID)
-            if (!state.codeModeEnabled) {
-              // In Pure ACP keep OpenCode's native `question` tool if present so elicitation/create works.
-              const questionTool = input.tools[OPENCODE_QUESTION_TOOL]
-              input.tools = questionTool ? { [OPENCODE_QUESTION_TOOL]: questionTool } : {}
-            }
-          } else {
+        Effect.gen(function* () {
+          if (input.model.providerID !== providerID) {
             sanitizeForNonAcpModel(input.messages)
+            return
+          }
+          sanitizeForAcpModel(input.messages)
+          const agentOption = ctx.agent?.get
+            ? yield* ctx.agent
+                .get({ agentID: input.agent as Agent.ID })
+                .pipe(Effect.option)
+            : Option.none()
+          const agentSystem =
+            agentOption._tag === "Some" ? agentOption.value.data.system : undefined
+          const rawInstructions = extractOpenCodeInstructions({
+            system: input.system,
+            agentName: input.agent,
+            agentSystem,
+          })
+          registry.updateContextSnapshot(input.sessionID, {
+            agent: input.agent,
+            tools: input.tools,
+            rawInstructions,
+          })
+          // Thin ACP: clear outer system instructions so agy owns its core system prompt;
+          // extracted instructions are forwarded via _meta.antigravity.systemPrompt.append.
+          input.system = []
+          const state = registry.getState(input.sessionID)
+          if (!state.codeModeEnabled) {
+            // In Pure ACP keep OpenCode's native `question` tool if present so elicitation/create works.
+            const questionTool = input.tools[OPENCODE_QUESTION_TOOL]
+            input.tools = questionTool ? { [OPENCODE_QUESTION_TOOL]: questionTool } : {}
           }
         }),
       )
+
+      const prepareSideCall = (input: SessionContext) =>
+        Effect.sync(() => {
+          if (input.model.providerID !== providerID) {
+            sanitizeForNonAcpModel(input.messages)
+            return
+          }
+          sanitizeForAcpModel(input.messages)
+          // Preserve input.system for compaction/generate side calls so OpenCode's summary/utility
+          // prompt passes straight through into role:"system" regardless of forwardInstructions.
+          input.tools = {}
+        })
+
+      yield* ctx.session.hook("compaction", prepareSideCall)
+      yield* ctx.session.hook("generate", prepareSideCall)
 
       yield* ctx.session.hook(
         "model.request",

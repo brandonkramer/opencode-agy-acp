@@ -230,7 +230,7 @@ export function sanitizeForAcpModel(messages: SessionRequestMessage[]): void {
   }
 }
 
-function formatToolResultOutput(output: LanguageModelV3ToolResultOutput): {
+export function formatToolResultOutput(output: LanguageModelV3ToolResultOutput): {
   readonly text: string
   readonly isError: boolean
 } {
@@ -381,7 +381,7 @@ function fileDataToBase64(data: Uint8Array | string | URL): string | undefined {
   return undefined
 }
 
-function appendCurrentUserBlocks(
+export function appendCurrentUserBlocks(
   currentUserMsg: LanguageModelV3Prompt[number] | undefined,
   blocks: AcpContentBlock[],
 ): void {

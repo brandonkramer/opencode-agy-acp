@@ -30,6 +30,8 @@ const pendingClientCalls = new Map<
 >()
 const sessionMcp = new Map<string, { url: string; headers: Record<string, string> }>()
 const sessionModel = new Map<string, string>()
+const sessionMode = new Map<string, string>()
+const sessionSystemAppend = new Map<string, string>()
 const sessionsFile = process.env.FAKE_AGY_SESSIONS_FILE
 function loadKnownSessions(): Set<string> {
   if (!sessionsFile || !fs.existsSync(sessionsFile)) return new Set<string>()
@@ -287,6 +289,28 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     return
   }
 
+  if (text.includes("[SCENARIO:ECHO_META]")) {
+    sendUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: `META:${JSON.stringify({
+          pid: process.pid,
+          sessionId,
+          mode: sessionMode.get(sessionId) ?? null,
+          model: sessionModel.get(sessionId) ?? null,
+          append: sessionSystemAppend.get(sessionId) ?? null,
+        })}`,
+      },
+    })
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: { stopReason: "end_turn" },
+    })
+    return
+  }
+
   // Default: PURE_OK
   sendUpdate(sessionId, {
     sessionUpdate: "agent_thought_chunk",
@@ -359,7 +383,13 @@ rl.on("line", (line) => {
   if (method === "session/new") {
     const sid = `fake-sess-${++sessionCounter}`
     saveKnownSession(sid)
-    logEvent({ method: "session/new", sessionId: sid })
+    const meta = params._meta as { antigravity?: { systemPrompt?: { append?: unknown } } } | undefined
+    const append =
+      typeof meta?.antigravity?.systemPrompt?.append === "string"
+        ? meta.antigravity.systemPrompt.append
+        : undefined
+    if (append !== undefined) sessionSystemAppend.set(sid, append)
+    logEvent({ method: "session/new", sessionId: sid, ...(append !== undefined ? { append } : {}) })
     const mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : []
     const oc = mcpServers.find((s) => s && typeof s === "object" && (s as { name?: string }).name === "oc") as
       | { url?: string; headers?: Array<{ name: string; value: string }> }
@@ -404,7 +434,13 @@ rl.on("line", (line) => {
       })
       return
     }
-    logEvent({ method: "session/resume", sessionId: sid })
+    const meta = params._meta as { antigravity?: { systemPrompt?: { append?: unknown } } } | undefined
+    const append =
+      typeof meta?.antigravity?.systemPrompt?.append === "string"
+        ? meta.antigravity.systemPrompt.append
+        : undefined
+    if (append !== undefined) sessionSystemAppend.set(sid, append)
+    logEvent({ method: "session/resume", sessionId: sid, ...(append !== undefined ? { append } : {}) })
     const mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : []
     const oc = mcpServers.find((s) => s && typeof s === "object" && (s as { name?: string }).name === "oc") as
       | { url?: string; headers?: Array<{ name: string; value: string }> }
@@ -424,7 +460,19 @@ rl.on("line", (line) => {
     return
   }
 
-  if (method === "session/set_mode" || method === "session/set_config_option" || method === "session/close") {
+  if (method === "session/set_mode") {
+    const sid = String(params.sessionId ?? "")
+    const mode = String(params.modeId ?? params.mode ?? "")
+    sessionMode.set(sid, mode)
+    logEvent({ method: "session/set_mode", sessionId: sid, mode })
+    send({ jsonrpc: "2.0", id: msg.id, result: {} })
+    return
+  }
+
+  if (method === "session/set_config_option" || method === "session/close") {
+    if (method === "session/close") {
+      logEvent({ method: "session/close", sessionId: params.sessionId })
+    }
     send({ jsonrpc: "2.0", id: msg.id, result: {} })
     return
   }

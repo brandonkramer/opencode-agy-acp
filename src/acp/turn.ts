@@ -153,6 +153,8 @@ export class ActiveTurn {
   private graceTimer?: ReturnType<typeof setTimeout>
   private pausedForPending = false
   private contextUsed?: number
+  private readonly completedTextBlocks: string[] = []
+  private currentTextBuffer = ""
   promptSettled = false
   abortedOnApiError = false
   promptResult?: AcpPromptResult
@@ -166,6 +168,12 @@ export class ActiveTurn {
 
   get activeNativeToolNames(): readonly string[] {
     return [...this.activeNativeTools.values()]
+  }
+
+  get assistantTextBlocks(): readonly string[] {
+    return this.currentTextBuffer.trim().length > 0
+      ? [...this.completedTextBlocks, this.currentTextBuffer]
+      : [...this.completedTextBlocks]
   }
 
   private syncWatchdogPause(): void {
@@ -492,15 +500,7 @@ export class ActiveTurn {
       const content = isRecord(update.content) ? update.content : undefined
       const text = typeof content?.text === "string" ? content.text : undefined
       if (!text) return
-      if (this.openTextId) {
-        const tid = this.openTextId
-        this.openTextId = undefined
-        this.emitPart({
-          type: "text-end",
-          id: tid,
-          providerMetadata: { [PROVIDER_ID]: { acp: true } },
-        })
-      }
+      this.closeOpenText()
       if (!this.openReasoningId) {
         this.openReasoningId = `r_${++this.partSeq}`
         this.emitPart({
@@ -545,6 +545,7 @@ export class ActiveTurn {
           providerMetadata: { [PROVIDER_ID]: { acp: true } },
         })
       }
+      this.currentTextBuffer += text
       this.emitPart({
         type: "text-delta",
         id: this.openTextId,
@@ -721,6 +722,22 @@ export class ActiveTurn {
     this.activeNativeTools.clear()
   }
 
+  private closeOpenText(): void {
+    if (this.currentTextBuffer.trim().length > 0) {
+      this.completedTextBlocks.push(this.currentTextBuffer)
+    }
+    this.currentTextBuffer = ""
+    if (this.openTextId) {
+      const id = this.openTextId
+      this.openTextId = undefined
+      this.emitPart({
+        type: "text-end",
+        id,
+        providerMetadata: { [PROVIDER_ID]: { acp: true } },
+      })
+    }
+  }
+
   private closeOpenBlocks(): void {
     if (this.openReasoningId) {
       const id = this.openReasoningId
@@ -731,15 +748,7 @@ export class ActiveTurn {
         providerMetadata: { [PROVIDER_ID]: { acp: true } },
       })
     }
-    if (this.openTextId) {
-      const id = this.openTextId
-      this.openTextId = undefined
-      this.emitPart({
-        type: "text-end",
-        id,
-        providerMetadata: { [PROVIDER_ID]: { acp: true } },
-      })
-    }
+    this.closeOpenText()
   }
 
   private emitPart(part: LanguageModelV3StreamPart): void {

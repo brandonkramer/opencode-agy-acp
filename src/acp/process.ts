@@ -359,6 +359,14 @@ export class AcpProcess {
       const name = typeof upd.name === "string" ? ` name=${upd.name}` : ""
       return `session/update(${kind}${name}${status})`
     }
+    if ((method === "session/new" || method === "session/resume") && isRecord(msg.params)) {
+      const meta = isRecord(msg.params._meta) ? msg.params._meta : undefined
+      const agy = meta && isRecord(meta.antigravity) ? meta.antigravity : undefined
+      const sysPrompt = agy && isRecord(agy.systemPrompt) ? agy.systemPrompt : undefined
+      const append = sysPrompt && typeof sysPrompt.append === "string" ? sysPrompt.append : undefined
+      const suffix = append ? ` appendChars=${append.length}` : ""
+      return `${method}${id ? ` ${id}` : ""}${suffix}`
+    }
     if (method) return `${method}${id ? ` ${id}` : ""}`
     if (msg.error !== undefined) return `response ${id} ERROR`
     return `response ${id} OK`
@@ -673,6 +681,7 @@ export class AcpProcess {
   newSession(params: {
     readonly cwd: string
     readonly mcpServers?: readonly AcpMcpServerHttp[]
+    readonly systemPromptAppend?: string
     readonly timeoutMs?: number
   }): Promise<AcpSessionResult> {
     return this.request<AcpSessionResult>(
@@ -680,6 +689,17 @@ export class AcpProcess {
       {
         cwd: params.cwd,
         mcpServers: params.mcpServers ? [...params.mcpServers] : [],
+        ...(params.systemPromptAppend
+          ? {
+              _meta: {
+                antigravity: {
+                  systemPrompt: {
+                    append: params.systemPromptAppend,
+                  },
+                },
+              },
+            }
+          : {}),
       },
       params.timeoutMs ?? 30_000,
     )
@@ -689,6 +709,7 @@ export class AcpProcess {
     readonly sessionId: string
     readonly cwd: string
     readonly mcpServers?: readonly AcpMcpServerHttp[]
+    readonly systemPromptAppend?: string
     readonly timeoutMs?: number
   }): Promise<AcpSessionResult> {
     return this.request<AcpSessionResult>(
@@ -697,6 +718,17 @@ export class AcpProcess {
         sessionId: params.sessionId,
         cwd: params.cwd,
         mcpServers: params.mcpServers ? [...params.mcpServers] : [],
+        ...(params.systemPromptAppend
+          ? {
+              _meta: {
+                antigravity: {
+                  systemPrompt: {
+                    append: params.systemPromptAppend,
+                  },
+                },
+              },
+            }
+          : {}),
       },
       params.timeoutMs ?? 20_000,
     )

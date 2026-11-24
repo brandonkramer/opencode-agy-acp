@@ -19,6 +19,8 @@ export const NATIVE_SHADOWED_TOOLS = new Set<string>([
 
 export type AcpMode = "auto" | "accept-edits" | "default" | "plan"
 
+export type RequestKind = "primary" | "compaction" | "generate"
+
 export type AcpAuthMethodId =
   | "oauth-personal"
   | "oauth-business"
@@ -30,6 +32,8 @@ export type CooldownBucket = QuotaBucket | "global"
 
 export interface AgySettings {
   readonly binaryPath?: string
+  readonly defaultMode: AcpMode
+  readonly forwardInstructions: boolean
   readonly codeMode: boolean
   readonly includeDefaultCustomizations: boolean
   readonly startupTimeoutMs: number
@@ -43,6 +47,8 @@ export interface AgySettings {
 }
 
 export const DEFAULT_SETTINGS: AgySettings = {
+  defaultMode: "auto",
+  forwardInstructions: true,
   codeMode: false,
   includeDefaultCustomizations: false,
   startupTimeoutMs: 30_000,
@@ -79,54 +85,69 @@ function readBool(value: unknown): boolean | undefined {
   return undefined
 }
 
+function readAcpMode(value: unknown): AcpMode | undefined {
+  if (typeof value !== "string") return undefined
+  const norm = value.trim().toLowerCase()
+  if (norm === "auto" || norm === "accept-edits" || norm === "default" || norm === "plan") {
+    return norm
+  }
+  return undefined
+}
+
 export function resolveSettings(
   providerOptions?: Record<string, unknown>,
   env: NodeJS.ProcessEnv = process.env,
+  base: AgySettings = DEFAULT_SETTINGS,
 ): AgySettings {
   const rawSettings = isRecord(providerOptions?.settings) ? providerOptions.settings : providerOptions ?? {}
   const binaryPath =
     (typeof rawSettings.binaryPath === "string" && rawSettings.binaryPath.trim()) ||
     (typeof env.AGY_BIN === "string" && env.AGY_BIN.trim()) ||
-    undefined
+    base.binaryPath
   const traceLogPath =
     (typeof rawSettings.traceLogPath === "string" && rawSettings.traceLogPath.trim()) ||
     (typeof env.AGY_ACP_TRACE_LOG === "string" && env.AGY_ACP_TRACE_LOG.trim()) ||
-    undefined
+    base.traceLogPath
   const extraDirs = Array.isArray(rawSettings.extraDirs)
     ? rawSettings.extraDirs.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-    : []
+    : base.extraDirs
 
   return {
     binaryPath,
-    codeMode: readBool(rawSettings.codeMode) ?? readBool(env.AGY_ACP_CODE_MODE) ?? DEFAULT_SETTINGS.codeMode,
+    defaultMode: readAcpMode(rawSettings.defaultMode) ?? readAcpMode(env.AGY_ACP_DEFAULT_MODE) ?? base.defaultMode,
+    forwardInstructions:
+      readBool(rawSettings.forwardInstructions) ??
+      readBool(env.AGY_ACP_FORWARD_INSTRUCTIONS) ??
+      base.forwardInstructions,
+    codeMode: readBool(rawSettings.codeMode) ?? readBool(env.AGY_ACP_CODE_MODE) ?? base.codeMode,
     includeDefaultCustomizations:
       readBool(rawSettings.includeDefaultCustomizations) ??
       readBool(env.AGY_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS) ??
-      DEFAULT_SETTINGS.includeDefaultCustomizations,
+      base.includeDefaultCustomizations,
     startupTimeoutMs:
       readPositiveInt(rawSettings.startupTimeoutMs) ??
       readPositiveInt(env.AGY_ACP_STARTUP_TIMEOUT_MS) ??
-      DEFAULT_SETTINGS.startupTimeoutMs,
+      base.startupTimeoutMs,
     chunkTimeoutMs:
       readPositiveInt(rawSettings.chunkTimeoutMs) ??
       readPositiveInt(env.AGY_ACP_CHUNK_TIMEOUT_MS) ??
-      DEFAULT_SETTINGS.chunkTimeoutMs,
+      base.chunkTimeoutMs,
     settleTimeoutMs:
       readPositiveInt(rawSettings.settleTimeoutMs) ??
       readPositiveInt(env.AGY_ACP_SETTLE_TIMEOUT_MS) ??
-      DEFAULT_SETTINGS.settleTimeoutMs,
+      base.settleTimeoutMs,
     permissionTimeoutMs:
       readPositiveInt(rawSettings.permissionTimeoutMs) ??
       readPositiveInt(env.AGY_ACP_PERMISSION_TIMEOUT_MS) ??
-      DEFAULT_SETTINGS.permissionTimeoutMs,
+      base.permissionTimeoutMs,
     nativeFlushGraceMs:
       readPositiveInt(rawSettings.nativeFlushGraceMs) ??
       readPositiveInt(env.AGY_ACP_NATIVE_FLUSH_GRACE_MS) ??
-      DEFAULT_SETTINGS.nativeFlushGraceMs,
+      base.nativeFlushGraceMs,
     idleTimeoutMs:
       readPositiveInt(rawSettings.idleTimeoutMs) ??
       readPositiveInt(env.AGY_ACP_IDLE_TIMEOUT_MS) ??
-      DEFAULT_SETTINGS.idleTimeoutMs,
+      base.idleTimeoutMs,
     traceLogPath,
     extraDirs,
   }

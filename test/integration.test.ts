@@ -432,7 +432,8 @@ describe("SessionRegistry + fake-agy integration", () => {
         prompt: handoffPrompt,
       })
       const handoffText = textFromParts(await readStreamParts(handoffStream))
-      expect(handoffText).toContain("[Historical assistant]: foreign model answer")
+      expect(handoffText).toContain("conversation-checkpoint")
+      expect(handoffText).toContain("Assistant: foreign model answer")
       expect(handoffText).toContain("[SCENARIO:ECHO_HANDOFF]")
     } finally {
       await registry.disposeAll()
@@ -469,23 +470,36 @@ describe("SessionRegistry + fake-agy integration", () => {
         headers: { "x-opencode-session-id": "ses_idle_1" },
         prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:PURE_OK] first" }] }],
       })
-      await readStreamParts(s1)
+      const parts1 = await readStreamParts(s1)
 
       const acpSid = registry.getState("ses_idle_1").acpSessionId
       expect(acpSid).toBeTruthy()
       expect(registry.getState("ses_idle_1").connected).toBe(true)
-      expect(store.get("antigravity-acp:session:ses_idle_1")).toBe(acpSid)
+      const persistedAfterTurn1 = JSON.parse(String(store.get("antigravity-acp:session:ses_idle_1"))) as {
+        acpSessionId: string
+        turns: unknown[]
+      }
+      expect(persistedAfterTurn1.acpSessionId).toBe(acpSid!)
+      expect(persistedAfterTurn1.turns).toHaveLength(1)
 
       // Arm idle reaper and wait past idleTimeoutMs
       registry.armIdle("ses_idle_1")
       await Bun.sleep(140)
       expect(registry.getState("ses_idle_1").connected).toBe(false)
-      expect(store.get("antigravity-acp:session:ses_idle_1")).toBe(acpSid)
+      const persistedWhileIdle = JSON.parse(String(store.get("antigravity-acp:session:ses_idle_1"))) as {
+        acpSessionId: string
+      }
+      expect(persistedWhileIdle.acpSessionId).toBe(acpSid!)
 
       // Next turn respawns proc and calls session/resume with preserved id
+      const a1Text = textFromParts(parts1)
       const { stream: s2 } = await lm.doStream({
         headers: { "x-opencode-session-id": "ses_idle_1" },
-        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:PURE_OK] resumed" }] }],
+        prompt: [
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:PURE_OK] first" }] },
+          { role: "assistant", content: [{ type: "text", text: a1Text }] },
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:PURE_OK] resumed" }] },
+        ],
       })
       const parts2 = await readStreamParts(s2)
       expect(textFromParts(parts2)).toContain("resumed")
@@ -543,6 +557,255 @@ describe("SessionRegistry + fake-agy integration", () => {
       else process.env.FAKE_AGY_EVENTS_LOG = prevEvents
       await registry.disposeAll()
       fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test("11. Auto-syncs OpenCode plan agent to ACP plan mode and respects explicit RPC override", async () => {
+    const { ctx } = createMockContext()
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({ codeMode: false }),
+    })
+    try {
+      const lm = createAgyLanguageModel("gemini-4-neon", registry)
+      const u1 = { role: "user" as const, content: [{ type: "text" as const, text: "[SCENARIO:ECHO_META]" }] }
+      const { stream: planStream } = await lm.doStream({
+        headers: {
+          "x-opencode-session-id": "ses_plan_1",
+          "x-opencode-agent": "plan",
+        },
+        prompt: [u1],
+      })
+      const planText = textFromParts(await readStreamParts(planStream))
+      const planMeta = JSON.parse(planText.replace("META:", "")) as { sessionId: string; mode: string | null }
+      expect(planMeta.mode).toBe("plan")
+      expect(registry.getState("ses_plan_1").mode).toBe("plan")
+
+      // Switching back to build agent restores defaultMode ("auto") on the same ACP session.
+      const u2 = { role: "user" as const, content: [{ type: "text" as const, text: "[SCENARIO:ECHO_META]" }] }
+      const { stream: buildStream } = await lm.doStream({
+        headers: {
+          "x-opencode-session-id": "ses_plan_1",
+          "x-opencode-agent": "build",
+        },
+        prompt: [
+          u1,
+          { role: "assistant", content: [{ type: "text", text: planText }] },
+          u2,
+        ],
+      })
+      const buildText = textFromParts(await readStreamParts(buildStream))
+      const buildMeta = JSON.parse(buildText.replace("META:", "")) as { sessionId: string; mode: string | null }
+      expect(buildMeta.sessionId).toBe(planMeta.sessionId)
+      expect(buildMeta.mode).toBe("auto")
+
+      // Explicit RPC override beats agent auto-sync.
+      await registry.setMode("ses_plan_1", "accept-edits")
+      const { stream: overrideStream } = await lm.doStream({
+        headers: {
+          "x-opencode-session-id": "ses_plan_1",
+          "x-opencode-agent": "plan",
+        },
+        prompt: [
+          u1,
+          { role: "assistant", content: [{ type: "text", text: planText }] },
+          u2,
+          { role: "assistant", content: [{ type: "text", text: buildText }] },
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_META]" }] },
+        ],
+      })
+      const overrideMeta = JSON.parse(
+        textFromParts(await readStreamParts(overrideStream)).replace("META:", ""),
+      ) as { sessionId: string; mode: string | null }
+      expect(overrideMeta.sessionId).toBe(planMeta.sessionId)
+      expect(overrideMeta.mode).toBe("accept-edits")
+    } finally {
+      await registry.disposeAll()
+    }
+  })
+
+  test("12. Forwards instructions via _meta.antigravity.systemPrompt.append unless disabled", async () => {
+    const { ctx } = createMockContext()
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({ codeMode: false, forwardInstructions: true }),
+    })
+    try {
+      registry.updateContextSnapshot("ses_inst_1", {
+        agent: "build",
+        tools: {},
+        rawInstructions: "Instructions from: /repo/AGENTS.md\nAlways run bun test.",
+      })
+      const lm = createAgyLanguageModel("gemini-4-neon", registry)
+      const { stream: s1 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_inst_1" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_META]" }] }],
+      })
+      const m1 = JSON.parse(textFromParts(await readStreamParts(s1)).replace("META:", "")) as {
+        append: string | null
+      }
+      expect(m1.append).toBe("Instructions from: /repo/AGENTS.md\nAlways run bun test.")
+
+      // When forwardInstructions is false, append is omitted.
+      registry.updateContextSnapshot("ses_inst_off", {
+        agent: "build",
+        tools: {},
+        rawInstructions: "Should not be forwarded",
+      })
+      const disabledLm = createAgyLanguageModel(
+        "gemini-4-neon",
+        registry,
+        makeSettings({ codeMode: false, forwardInstructions: false }),
+      )
+      const { stream: s2 } = await disabledLm.doStream({
+        headers: { "x-opencode-session-id": "ses_inst_off" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_META]" }] }],
+      })
+      const m2 = JSON.parse(textFromParts(await readStreamParts(s2)).replace("META:", "")) as {
+        append: string | null
+      }
+      expect(m2.append).toBeNull()
+    } finally {
+      await registry.disposeAll()
+    }
+  })
+
+  test("13. Fingerprints turns for delta catch-up without wiping ACP session, and resets on undo/edit", async () => {
+    const { ctx } = createMockContext()
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({ codeMode: false }),
+    })
+    try {
+      const lm = createAgyLanguageModel("gemini-4-neon", registry)
+
+      // Turn 1: initial turn
+      const u1 = { role: "user" as const, content: [{ type: "text" as const, text: "first prompt" }] }
+      const { stream: s1 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_sync_1" },
+        prompt: [u1],
+      })
+      const p1 = await readStreamParts(s1)
+      const a1Text = textFromParts(p1)
+      const acpSid1 = registry.getState("ses_sync_1").acpSessionId
+      expect(acpSid1).toBeTruthy()
+
+      // Turn 2: reuses same ACP session and replays thin prompt even with acp_* hosted tool in history
+      const { stream: s2 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_sync_1" },
+        prompt: [
+          u1,
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool-call",
+                toolCallId: "tc_read_1",
+                toolName: "acp_read_file",
+                input: { path: "README.md" },
+                providerExecuted: true,
+              },
+              { type: "text", text: a1Text },
+            ],
+          },
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_HANDOFF]" }] },
+        ],
+      })
+      const echo2 = textFromParts(await readStreamParts(s2))
+      expect(registry.getState("ses_sync_1").acpSessionId).toBe(acpSid1)
+      expect(echo2).not.toContain("<conversation-checkpoint")
+
+      // Turn 3: foreign model turn inserted after Turn 2 -> delta catch-up on SAME ACP session
+      const u2 = { role: "user" as const, content: [{ type: "text" as const, text: "[SCENARIO:ECHO_HANDOFF]" }] }
+      const { stream: s3 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_sync_1" },
+        prompt: [
+          u1,
+          { role: "assistant", content: [{ type: "text", text: a1Text }] },
+          u2,
+          { role: "assistant", content: [{ type: "text", text: echo2 }] },
+          { role: "user", content: [{ type: "text", text: "foreign turn prompt" }] },
+          { role: "assistant", content: [{ type: "text", text: "foreign model reply" }] },
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_HANDOFF]" }] },
+        ],
+      })
+      const echo3 = textFromParts(await readStreamParts(s3))
+      const echo3Blocks = JSON.parse(echo3.slice("ECHO:".length)) as Array<{ text?: string }>
+      const echo3Checkpoint = echo3Blocks[0]?.text ?? ""
+      expect(registry.getState("ses_sync_1").acpSessionId).toBe(acpSid1)
+      expect(echo3Checkpoint).toContain('<conversation-checkpoint mode="catch-up">')
+      expect(echo3Checkpoint).toContain("foreign model reply")
+      expect(echo3Checkpoint).not.toContain("first prompt")
+
+      // Turn 4: /undo truncates history -> rotates to a fresh ACP session
+      const { stream: s4 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_sync_1" },
+        prompt: [
+          u1,
+          { role: "assistant", content: [{ type: "text", text: a1Text }] },
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_HANDOFF]" }] },
+        ],
+      })
+      const echo4 = textFromParts(await readStreamParts(s4))
+      const echo4Blocks = JSON.parse(echo4.slice("ECHO:".length)) as Array<{ text?: string }>
+      const echo4Checkpoint = echo4Blocks[0]?.text ?? ""
+      const acpSid2 = registry.getState("ses_sync_1").acpSessionId
+      expect(acpSid2).toBeTruthy()
+      expect(acpSid2).not.toBe(acpSid1)
+      expect(echo4Checkpoint).toContain('<conversation-checkpoint mode="restore">')
+    } finally {
+      await registry.disposeAll()
+    }
+  })
+
+  test("14. Isolates compaction and generate side calls from primary ACP session and storage", async () => {
+    const { ctx, store } = createMockContext()
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({ codeMode: false }),
+    })
+    try {
+      const lm = createAgyLanguageModel("gemini-4-neon", registry)
+      const { stream: primaryStream } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_side_1" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_META]" }] }],
+      })
+      const primaryMeta = JSON.parse(
+        textFromParts(await readStreamParts(primaryStream)).replace("META:", ""),
+      ) as { pid: number; sessionId: string }
+      const primarySid = registry.getState("ses_side_1").acpSessionId
+      const storedBefore = store.get("antigravity-acp:session:ses_side_1")
+      expect(primarySid).toBeTruthy()
+      expect(storedBefore).toBeTruthy()
+
+      const { stream: compactionStream } = await lm.doStream({
+        headers: {
+          "x-opencode-session-id": "ses_side_1",
+          "x-opencode-request-kind": "compaction",
+        },
+        prompt: [
+          { role: "user", content: [{ type: "text", text: "primary turn" }] },
+          { role: "assistant", content: [{ type: "text", text: "primary reply" }] },
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_META]" }] },
+        ],
+      })
+      const compMeta = JSON.parse(
+        textFromParts(await readStreamParts(compactionStream)).replace("META:", ""),
+      ) as { pid: number; sessionId: string }
+      expect(compMeta.sessionId).toBeTruthy()
+      expect(compMeta.pid).not.toBe(primaryMeta.pid)
+
+      const { stream: generateStream } = await lm.doStream({
+        headers: {
+          "x-opencode-session-id": "ses_side_1",
+          "x-opencode-request-kind": "generate",
+        },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:PURE_OK] title" }] }],
+      })
+      expect(textFromParts(await readStreamParts(generateStream))).toContain("title")
+
+      // Primary session ID, storage record, and idle state remain completely untouched.
+      expect(registry.getState("ses_side_1").acpSessionId).toBe(primarySid)
+      expect(registry.getState("ses_side_1").busy).toBe(false)
+      expect(store.get("antigravity-acp:session:ses_side_1")).toBe(storedBefore)
+    } finally {
+      await registry.disposeAll()
     }
   })
 })

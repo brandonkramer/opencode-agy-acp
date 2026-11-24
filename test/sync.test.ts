@@ -1,0 +1,176 @@
+import { describe, expect, test } from "bun:test"
+import type { LanguageModelV3Prompt } from "@ai-sdk/provider"
+import {
+  buildCheckpointPromptBlocks,
+  buildSavedHistory,
+  buildSideCallPromptBlocks,
+  decideSync,
+  fingerprintGroups,
+  hashAssistantTextBlocks,
+  parsePersistedRecord,
+} from "../src/acp/sync.js"
+import { PROVIDER_ID } from "../src/types.js"
+
+describe("turn fingerprinting and delta sync", () => {
+  test("parsePersistedRecord handles legacy string, valid v1 JSON, and invalid inputs", () => {
+    expect(parsePersistedRecord("legacy-acp-id")).toEqual({
+      version: 1,
+      acpSessionId: "legacy-acp-id",
+      turns: [],
+    })
+    expect(
+      parsePersistedRecord(
+        JSON.stringify({
+          version: 1,
+          acpSessionId: "acp_1",
+          lastModelId: "gemini-4-neon-high",
+          turns: [{ userHash: "u1", assistantHash: "a1" }],
+        }),
+      ),
+    ).toEqual({
+      version: 1,
+      acpSessionId: "acp_1",
+      lastModelId: "gemini-4-neon-high",
+      turns: [{ userHash: "u1", assistantHash: "a1" }],
+    })
+    expect(parsePersistedRecord("{broken json")).toBeUndefined()
+    expect(parsePersistedRecord(JSON.stringify({ version: 2 }))).toBeUndefined()
+  })
+
+  test("fingerprintGroups skips acp_* hosted tool calls & reasoning so Turn 2 matches Turn 1", () => {
+    const turn1User: LanguageModelV3Prompt[number] = {
+      role: "user",
+      content: [{ type: "text", text: "Inspect README" }],
+    }
+    const recordedTurns = buildSavedHistory({
+      priorGroups: [],
+      currentUserMessage: turn1User,
+      assistantTextBlocks: ["Let me check.", "Done inspecting."],
+    })
+
+    const turn2Prompt: LanguageModelV3Prompt = [
+      { role: "system", content: "system" },
+      turn1User,
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "internal thinking" },
+          { type: "text", text: "Let me check." },
+          {
+            type: "tool-call",
+            toolCallId: "tc_1",
+            toolName: "acp_read_file",
+            input: { path: "README.md" },
+            providerExecuted: true,
+          },
+          {
+            type: "tool-result",
+            toolCallId: "tc_1",
+            toolName: "acp_read_file",
+            output: { type: "text", value: "contents" },
+            providerMetadata: { [PROVIDER_ID]: { acp: true } },
+          } as never,
+          { type: "text", text: "Done inspecting." },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "local status note" }],
+        providerMetadata: { [PROVIDER_ID]: { localStatus: true } },
+      } as never,
+      { role: "user", content: [{ type: "text", text: "Follow up question" }] },
+    ]
+
+    const groups = fingerprintGroups(turn2Prompt)
+    expect(groups).toHaveLength(2)
+    const priorGroups = groups.slice(0, -1)
+    expect(priorGroups[0]?.assistantHash).toBe(hashAssistantTextBlocks(["Let me check.", "Done inspecting."]))
+
+    const decision = decideSync({
+      recorded: { version: 1, acpSessionId: "acp_1", turns: recordedTurns },
+      priorGroups,
+      hasLiveOrResumableAcpSession: true,
+    })
+    expect(decision).toEqual({ kind: "continue", matchedCount: 1 })
+  })
+
+  test("decideSync returns catch-up for unseen trailing turns, and diverged on undo/edit", () => {
+    const u1: LanguageModelV3Prompt[number] = { role: "user", content: [{ type: "text", text: "turn 1" }] }
+    const u2: LanguageModelV3Prompt[number] = { role: "user", content: [{ type: "text", text: "turn 2" }] }
+    const u3: LanguageModelV3Prompt[number] = { role: "user", content: [{ type: "text", text: "turn 3" }] }
+
+    const recordedTurns = buildSavedHistory({
+      priorGroups: [],
+      currentUserMessage: u1,
+      assistantTextBlocks: ["agy answer 1"],
+    })
+    const recorded = { version: 1 as const, acpSessionId: "acp_live", turns: recordedTurns }
+
+    // Cross-model turn inserted between ACP turns
+    const catchUpPrompt: LanguageModelV3Prompt = [
+      u1,
+      { role: "assistant", content: [{ type: "text", text: "agy answer 1" }] },
+      u2,
+      { role: "assistant", content: [{ type: "text", text: "gpt answer 2" }] },
+      u3,
+    ]
+    const catchUpGroups = fingerprintGroups(catchUpPrompt)
+    const catchUp = decideSync({
+      recorded,
+      priorGroups: catchUpGroups.slice(0, -1),
+      hasLiveOrResumableAcpSession: true,
+    })
+    expect(catchUp.kind).toBe("catch-up")
+    if (catchUp.kind === "catch-up") {
+      expect(catchUp.unseenGroups).toHaveLength(1)
+      expect(catchUp.matchedCount).toBe(1)
+      const blocks = buildCheckpointPromptBlocks({
+        groups: catchUp.unseenGroups,
+        currentUserMessage: catchUpGroups.at(-1)?.userMessage,
+        mode: "catch-up",
+      })
+      expect(blocks[0]).toMatchObject({ type: "text" })
+      expect((blocks[0] as { text: string }).text).toContain('<conversation-checkpoint mode="catch-up">')
+      expect((blocks[0] as { text: string }).text).toContain("gpt answer 2")
+      expect((blocks[0] as { text: string }).text).not.toContain("agy answer 1")
+      expect((blocks[1] as { text: string }).text).toBe("turn 3")
+    }
+
+    // Undo removes turn 1
+    const undoDecision = decideSync({
+      recorded,
+      priorGroups: [],
+      hasLiveOrResumableAcpSession: true,
+    })
+    expect(undoDecision.kind).toBe("diverged")
+
+    // Edit changes turn 1 text
+    const editedPrompt: LanguageModelV3Prompt = [
+      { role: "user", content: [{ type: "text", text: "edited turn 1" }] },
+      { role: "assistant", content: [{ type: "text", text: "agy answer 1" }] },
+      u2,
+    ]
+    const editDecision = decideSync({
+      recorded,
+      priorGroups: fingerprintGroups(editedPrompt).slice(0, -1),
+      hasLiveOrResumableAcpSession: true,
+    })
+    expect(editDecision.kind).toBe("diverged")
+  })
+
+  test("buildSideCallPromptBlocks formats compaction and generate prompts chronologically", () => {
+    const blocks = buildSideCallPromptBlocks(
+      [
+        { role: "system", content: "Summarize concisely." },
+        { role: "user", content: [{ type: "text", text: "First request" }] },
+        { role: "assistant", content: [{ type: "text", text: "First response" }] },
+        { role: "user", content: [{ type: "text", text: "Produce a summary." }] },
+      ],
+      "compaction",
+    )
+    expect(blocks.length).toBeGreaterThanOrEqual(2)
+    expect((blocks[0] as { text: string }).text).toContain("<compaction-context>")
+    expect((blocks[0] as { text: string }).text).toContain("First response")
+    expect((blocks[1] as { text: string }).text).toBe("Produce a summary.")
+  })
+})

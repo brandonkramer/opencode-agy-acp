@@ -6,7 +6,7 @@ import type {
 } from "@ai-sdk/provider"
 import type { SessionRegistry } from "./acp/sessions.js"
 import { buildUsage } from "./acp/turn.js"
-import { PROVIDER_ID, type AgySettings } from "./types.js"
+import { PROVIDER_ID, type AgySettings, type RequestKind } from "./types.js"
 
 export function createAgyLanguageModel(
   modelID: string,
@@ -58,10 +58,17 @@ export function createAgyLanguageModel(
       const headers = options.headers ?? {}
       const sessionID = String(headers["x-opencode-session-id"] ?? "__default__")
       const variant = String(headers["x-opencode-variant"] ?? "") || undefined
+      const rawKind = headers["x-opencode-request-kind"]
+      const requestKind: RequestKind =
+        rawKind === "compaction" || rawKind === "generate" ? rawKind : "primary"
+      const rawAgent = headers["x-opencode-agent"]
+      const agent = typeof rawAgent === "string" && rawAgent.trim() ? rawAgent.trim() : undefined
       const stream = await registry.startOrResumeTurn({
         sessionID,
         modelID,
         variant,
+        requestKind,
+        agent,
         prompt: options.prompt,
         abortSignal: options.abortSignal,
         runtimeSettings,
