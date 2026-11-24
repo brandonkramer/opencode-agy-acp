@@ -167,12 +167,13 @@ export default Plugin.define({
             : Option.none()
           const agentSystem =
             agentOption._tag === "Some" ? agentOption.value.data.system : undefined
-          const state = registry.getState(input.sessionID)
+          const resolvedTools = registry.resolveContextTools(input.sessionID, input.tools)
           const rawInstructions = extractOpenCodeInstructions({
             system: input.system,
             agentName: input.agent,
             agentSystem,
-            codeModeEnabled: state.codeModeEnabled,
+            codeModeEnabled: resolvedTools.codeModeEnabled,
+            relayedToolNames: resolvedTools.relayedToolNames,
           })
           registry.updateContextSnapshot(input.sessionID, {
             agent: input.agent,
@@ -182,7 +183,7 @@ export default Plugin.define({
           // Thin ACP: clear outer system instructions so agy owns its core system prompt;
           // extracted instructions are forwarded via _meta.antigravity.systemPrompt.append.
           input.system = []
-          if (!state.codeModeEnabled) {
+          if (!resolvedTools.codeModeEnabled) {
             // In Pure ACP keep OpenCode's native `question` tool if present so elicitation/create works.
             const questionTool = input.tools[OPENCODE_QUESTION_TOOL]
             input.tools = questionTool ? { [OPENCODE_QUESTION_TOOL]: questionTool } : {}
@@ -282,6 +283,14 @@ export default Plugin.define({
           Effect.promise(() => registry.refreshModelsInBackground()).pipe(
             Effect.catch(() => Effect.void),
           ),
+        )
+      }
+
+      if (registry.settings.prewarm) {
+        yield* Effect.forkScoped(
+          Effect.sync(() => {
+            registry.prewarmStandby()
+          }),
         )
       }
 

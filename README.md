@@ -6,10 +6,12 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
 
 1. **Stream-idle watchdog (`chunkTimeoutMs`, default 120s):** Rejects wedged `session/prompt` calls with `AcpStallError` + the last 8 wire-trace entries, cancels and kills the hung process group, and resets the session cleanly instead of hanging forever. Automatically pauses while OpenCode runs relayed tools, `question`, or permission prompts.
 2. **Deadlock-free tool & elicitation handling:**
-   - **Pure ACP by default** (`codeMode: false`) so `agy` runs natively with zero MCP relay overhead and no `--process-per-session` hop.
-   - When `codeMode: true`, relayed MCP calls never deadlock on `activeNativeTools` (reclassification on `mcp_oc_` / `oc_` / `oc:` / relayed names + bounded `nativeFlushGraceMs`, default 2s).
+   - **Hybrid Auto Code Mode by default (`codeMode: "auto"`):** Keeps native `agy` tools fast for local edits/shell (`NATIVE_SHADOWED_TOOLS`) while automatically relaying OpenCode's non-shadowed tools (`execute`, `subagent`, MCP servers) without `--process-per-session` overhead. Supports `extraRelayedTools` / `blockedRelayedTools` overrides or forcing `true` / `false`.
+   - **`mcp_oc_execute` & rich media bridging:** Guides `agy` from OpenCode's `execute` docs directly to `mcp_oc_execute`, streams image/file attachments from OpenCode tool results over MCP, and avoids false deadlocks on `activeNativeTools` (`nativeFlushGraceMs`, default 2s).
    - Full `elicitation/create` → OpenCode `question` bridge works in both Pure ACP and Code Mode.
-3. **Structured Effect concurrency:** Per-session `Semaphore(1)` serialization, 5-minute idle worker reaper (`idleTimeoutMs`, preserving `acpSessionId` for `session/resume`), and `retry: false` hook to prevent double-retries.
+3. **Structured Effect concurrency & warm worker pooling:**
+   - Pre-warmed authenticated standby `agy` worker (`prewarm: true` by default) + shared warm side-call worker for isolated `/compact` & judge (`generate`) calls to avoid repeated OAuth startup hops (~1.6s -> ~7ms per new session).
+   - Per-session `Semaphore(1)` serialization, 5-minute idle worker reaper (`idleTimeoutMs`, preserving `acpSessionId` for `session/resume`), and `retry: false` hook to prevent double-retries.
 4. **MCP isolation (`includeDefaultCustomizations: false` by default):** Prevents each `agy acp` worker from spawning duplicate copies of `~/.gemini` MCP servers.
 5. **Bounded permissions & fixed `stdin.write` error propagation.**
 6. **Plan mode auto-sync (`defaultMode`, default `"auto"`):** Automatically switches `agy` to `"plan"` when using OpenCode's `plan` agent and back when leaving `plan` (unless explicitly overridden via RPC `setMode`).
@@ -27,7 +29,8 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
       "settings": {
         "defaultMode": "auto",
         "forwardInstructions": true,
-        "codeMode": false,
+        "codeMode": "auto",
+        "prewarm": true,
         "includeDefaultCustomizations": false,
         "chunkTimeoutMs": 120000,
         "permissionTimeoutMs": 300000,
@@ -43,7 +46,9 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
 - `AGY_BIN`: explicit path to `agy`
 - `AGY_ACP_DEFAULT_MODE=auto|accept-edits|default|plan`
 - `AGY_ACP_FORWARD_INSTRUCTIONS=true|false`
-- `AGY_ACP_CODE_MODE=true|false`
+- `AGY_ACP_CODE_MODE=auto|true|false`
+- `AGY_ACP_PREWARM=true|false`
+- `AGY_ACP_MAX_SYSTEM_PROMPT_CHARS`
 - `AGY_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS=true|false`
 - `AGY_ACP_CHUNK_TIMEOUT_MS`
 - `AGY_ACP_TRACE_LOG=/path/to/trace.jsonl`

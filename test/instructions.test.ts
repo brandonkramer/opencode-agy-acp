@@ -122,7 +122,27 @@ describe("instructions forwarding helpers", () => {
     ).toBe("Keep this\n\nAnd this")
   })
 
-  test("buildSystemPromptAppend respects forwardInstructions and hashSystemPrompt is deterministic", () => {
+  test("adds mcp_oc_execute bridge note when codeModeEnabled is true with relayedToolNames, omitted otherwise", () => {
+    const withRelay = extractOpenCodeInstructions({
+      agentName: "build",
+      codeModeEnabled: true,
+      relayedToolNames: ["execute", "subagent"],
+      system: [{ type: "text", text: "You are Gemini." }],
+    })
+    expect(withRelay).toContain("# OpenCode Relayed Tools (MCP `oc`)")
+    expect(withRelay).toContain("`mcp_oc_execute`")
+    expect(withRelay).toContain("`mcp_oc_subagent`")
+
+    const withoutRelay = extractOpenCodeInstructions({
+      agentName: "build",
+      codeModeEnabled: false,
+      relayedToolNames: ["execute"],
+      system: [{ type: "text", text: "You are Gemini." }],
+    })
+    expect(withoutRelay).toBeUndefined()
+  })
+
+  test("buildSystemPromptAppend respects forwardInstructions, maxChars truncation, and hashSystemPrompt", () => {
     expect(
       buildSystemPromptAppend({ rawInstructions: "Follow AGENTS.md", forwardInstructions: false }),
     ).toBeUndefined()
@@ -131,6 +151,13 @@ describe("instructions forwarding helpers", () => {
       forwardInstructions: true,
     })
     expect(appended).toBe("Follow AGENTS.md")
+    const truncated = buildSystemPromptAppend({
+      rawInstructions: "A".repeat(100),
+      forwardInstructions: true,
+      maxChars: 30,
+    })
+    expect(truncated).toHaveLength(30)
+    expect(truncated?.endsWith("...[truncated]")).toBe(true)
     expect(hashSystemPrompt(appended)).toBe(hashSystemPrompt("Follow AGENTS.md"))
     expect(hashSystemPrompt(appended)).not.toBe(hashSystemPrompt("Different"))
     expect(hashSystemPrompt(undefined)).toBe("none")

@@ -53,6 +53,7 @@ function makeSettings(overrides: Partial<AgySettings> = {}): AgySettings {
   return {
     ...DEFAULT_SETTINGS,
     binaryPath: FAKE_AGY,
+    prewarm: false,
     startupTimeoutMs: 5_000,
     chunkTimeoutMs: 5_000,
     settleTimeoutMs: 500,
@@ -796,9 +797,14 @@ describe("SessionRegistry + fake-agy integration", () => {
           "x-opencode-session-id": "ses_side_1",
           "x-opencode-request-kind": "generate",
         },
-        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:PURE_OK] title" }] }],
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_META]" }] }],
       })
-      expect(textFromParts(await readStreamParts(generateStream))).toContain("title")
+      const genMeta = JSON.parse(
+        textFromParts(await readStreamParts(generateStream)).replace("META:", ""),
+      ) as { pid: number; sessionId: string }
+      // Side calls reuse the same shared warm worker across compaction & generate, isolated from primary.
+      expect(genMeta.pid).toBe(compMeta.pid)
+      expect(genMeta.pid).not.toBe(primaryMeta.pid)
 
       // Primary session ID, storage record, and idle state remain completely untouched.
       expect(registry.getState("ses_side_1").acpSessionId).toBe(primarySid)
@@ -806,6 +812,213 @@ describe("SessionRegistry + fake-agy integration", () => {
       expect(store.get("antigravity-acp:session:ses_side_1")).toBe(storedBefore)
     } finally {
       await registry.disposeAll()
+    }
+  })
+
+  test("15. Code Mode omits --process-per-session, keeps tools.opencode.* docs, injects mcp_oc_execute hint, and forwards images", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-cm15-"))
+    const argsLog = path.join(tmp, "args.log")
+    const prevArgs = process.env.FAKE_AGY_ARGS_LOG
+    process.env.FAKE_AGY_ARGS_LOG = argsLog
+
+    const { ctx } = createMockContext({ cwd: tmp })
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({ codeMode: true }),
+    })
+    try {
+      const tools = {
+        execute: {
+          description: "Run JS. Use `tools.opencode.session.move()` to relocate worktree.",
+          input: { type: "object", properties: { code: { type: "string" } } },
+        },
+      }
+      const resolved = registry.resolveContextTools("ses_cm15", tools)
+      const instructions = [
+        "# OpenCode Relayed Tools (MCP `oc`)",
+        `- OpenCode's Code Mode \`execute\` tool is callable here as \`mcp_oc_execute\` (${resolved.relayedToolNames.join(",")}).`,
+      ].join("\n")
+      registry.updateContextSnapshot("ses_cm15", {
+        agent: "build",
+        tools,
+        rawInstructions: instructions,
+      })
+
+      const lm = createAgyLanguageModel("gemini-4-neon", registry)
+      const { stream: s1 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_cm15" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:LIST_MCP_TOOLS]" }] }],
+      })
+      const listPayload = JSON.parse(
+        textFromParts(await readStreamParts(s1)).replace("MCP_TOOLS:", ""),
+      ) as { mcp: { tools: Array<{ name: string; description: string }> }; append: string }
+
+      expect(listPayload.append).toContain("mcp_oc_execute")
+      const execTool = listPayload.mcp.tools.find((t) => t.name === "execute")
+      expect(execTool?.description).toContain("tools.opencode.session.move")
+      expect(execTool?.description).toContain("mcp_oc_execute")
+
+      const loggedArgs = JSON.parse(fs.readFileSync(argsLog, "utf8").trim()) as string[]
+      expect(loggedArgs).not.toContain("--process-per-session")
+
+      // Image content forwarding through MCP relay
+      const u1 = { role: "user" as const, content: [{ type: "text" as const, text: "[SCENARIO:LIST_MCP_TOOLS]" }] }
+      const { stream: s2 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_cm15" },
+        prompt: [
+          u1,
+          { role: "assistant", content: [{ type: "text", text: `MCP_TOOLS:${JSON.stringify(listPayload)}` }] },
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:MCP_IMAGE_TOOL]" }] },
+        ],
+      })
+      const callParts = await readStreamParts(s2)
+      const toolCall = callParts.find((p) => p.type === "tool-call" && p.toolName === "execute")
+      expect(toolCall?.type).toBe("tool-call")
+      if (toolCall?.type === "tool-call") {
+        const { stream: s3 } = await lm.doStream({
+          headers: { "x-opencode-session-id": "ses_cm15" },
+          prompt: [
+            u1,
+            { role: "assistant", content: [{ type: "text", text: `MCP_TOOLS:${JSON.stringify(listPayload)}` }] },
+            { role: "user", content: [{ type: "text", text: "[SCENARIO:MCP_IMAGE_TOOL]" }] },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: toolCall.toolCallId,
+                  toolName: toolCall.toolName,
+                  output: {
+                    type: "content",
+                    value: [
+                      { type: "text", text: "screenshot taken" },
+                      { type: "image-data", data: "aGVsbG8=", mediaType: "image/png" },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+        })
+        const finalText = textFromParts(await readStreamParts(s3))
+        expect(finalText).toContain('"type":"image"')
+        expect(finalText).toContain('"mimeType":"image/png"')
+        expect(finalText).toContain('"data":"aGVsbG8="')
+      }
+    } finally {
+      if (prevArgs === undefined) delete process.env.FAKE_AGY_ARGS_LOG
+      else process.env.FAKE_AGY_ARGS_LOG = prevArgs
+      await registry.disposeAll()
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test("16. Hybrid auto Code Mode enables only for non-shadowed tools and ignores shadowed tool churn", async () => {
+    const { ctx } = createMockContext()
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({
+        codeMode: "auto",
+        extraRelayedTools: ["grep"],
+        blockedRelayedTools: ["subagent"],
+      }),
+    })
+    try {
+      // Only shadowed built-ins (besides extraRelayedTools test)
+      const onlyShadowed = registry.resolveContextTools("ses_auto_1", {
+        bash: { description: "Run shell", input: {} },
+        question: { description: "Ask", input: {} },
+      })
+      expect(onlyShadowed.codeModeEnabled).toBe(false)
+      expect(onlyShadowed.relayedToolNames).toEqual([])
+
+      // Non-shadowed execute + extraRelayed grep + blocked subagent
+      const hybrid = registry.resolveContextTools("ses_auto_2", {
+        bash: { description: "Run shell v1", input: {} },
+        grep: { description: "Search", input: {} },
+        subagent: { description: "Blocked", input: {} },
+        execute: { description: "Run JS", input: {} },
+      })
+      expect(hybrid.codeModeEnabled).toBe(true)
+      expect(hybrid.relayedToolNames).toEqual(["grep", "execute"])
+
+      registry.updateContextSnapshot("ses_auto_2", {
+        agent: "build",
+        tools: {
+          bash: { description: "Run shell v1", input: {} },
+          grep: { description: "Search", input: {} },
+          execute: { description: "Run JS", input: {} },
+        },
+      })
+
+      const lm = createAgyLanguageModel("gemini-4-neon", registry)
+      const u1 = { role: "user" as const, content: [{ type: "text" as const, text: "[SCENARIO:ECHO_META]" }] }
+      const { stream: s1 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_auto_2" },
+        prompt: [u1],
+      })
+      const a1 = textFromParts(await readStreamParts(s1))
+      const sid1 = (JSON.parse(a1.replace("META:", "")) as { sessionId: string }).sessionId
+
+      // Mutate shadowed `bash` tool schema — live ACP session must NOT reset!
+      registry.updateContextSnapshot("ses_auto_2", {
+        agent: "build",
+        tools: {
+          bash: { description: "Run shell v2 changed!", input: { extra: true } },
+          grep: { description: "Search", input: {} },
+          execute: { description: "Run JS", input: {} },
+        },
+      })
+      const { stream: s2 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_auto_2" },
+        prompt: [
+          u1,
+          { role: "assistant", content: [{ type: "text", text: a1 }] },
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_META]" }] },
+        ],
+      })
+      const sid2 = (
+        JSON.parse(textFromParts(await readStreamParts(s2)).replace("META:", "")) as {
+          sessionId: string
+        }
+      ).sessionId
+      expect(sid2).toBe(sid1)
+    } finally {
+      await registry.disposeAll()
+    }
+  })
+
+  test("17. Prewarm standby process is claimed by Turn 1 without spawning a duplicate worker", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-prewarm-"))
+    const argsLog = path.join(tmp, "args.log")
+    const prevArgs = process.env.FAKE_AGY_ARGS_LOG
+    process.env.FAKE_AGY_ARGS_LOG = argsLog
+
+    const { ctx } = createMockContext({ cwd: tmp })
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({ codeMode: false, prewarm: true }),
+    })
+    try {
+      registry.prewarmStandby()
+      await Bun.sleep(80)
+      // Turn off refill before Turn 1 so we verify claimStandby uses the prewarmed PID rather than spawning fresh.
+      const lm = createAgyLanguageModel(
+        "gemini-4-neon",
+        registry,
+        makeSettings({ codeMode: false, prewarm: false }),
+      )
+      const { stream } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_prewarm_1" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:PURE_OK] claimed" }] }],
+      })
+      const text = textFromParts(await readStreamParts(stream))
+      expect(text).toContain("claimed")
+
+      const spawnLines = fs.readFileSync(argsLog, "utf8").trim().split("\n")
+      expect(spawnLines).toHaveLength(1)
+    } finally {
+      if (prevArgs === undefined) delete process.env.FAKE_AGY_ARGS_LOG
+      else process.env.FAKE_AGY_ARGS_LOG = prevArgs
+      await registry.disposeAll()
+      fs.rmSync(tmp, { recursive: true, force: true })
     }
   })
 })

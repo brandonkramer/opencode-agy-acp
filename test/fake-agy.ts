@@ -95,6 +95,27 @@ async function callMcpTool(
   return json.result
 }
 
+async function listMcpTools(sessionId: string): Promise<unknown> {
+  const mcp = sessionMcp.get(sessionId)
+  if (!mcp) throw new Error("No MCP server configured for session")
+  const res = await fetch(mcp.url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...mcp.headers,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+      params: {},
+    }),
+  })
+  const json = (await res.json()) as { result?: unknown; error?: unknown }
+  if (json.error) throw new Error(JSON.stringify(json.error))
+  return json.result
+}
+
 function extractPromptText(prompt: unknown): string {
   if (!Array.isArray(prompt)) return ""
   return prompt
@@ -148,6 +169,40 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     sendUpdate(sessionId, {
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text: `MCP_RESULT:${mcpText}` },
+    })
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: { stopReason: "end_turn" },
+    })
+    return
+  }
+
+  if (text.includes("[SCENARIO:MCP_IMAGE_TOOL]")) {
+    const res = await callMcpTool(sessionId, "execute", { code: "screenshot()" })
+    sendUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: `IMAGE_RES:${JSON.stringify(res)}` },
+    })
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: { stopReason: "end_turn" },
+    })
+    return
+  }
+
+  if (text.includes("[SCENARIO:LIST_MCP_TOOLS]")) {
+    const res = await listMcpTools(sessionId)
+    sendUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: `MCP_TOOLS:${JSON.stringify({
+          mcp: res,
+          append: sessionSystemAppend.get(sessionId) ?? null,
+        })}`,
+      },
     })
     send({
       jsonrpc: "2.0",

@@ -21,6 +21,8 @@ export type AcpMode = "auto" | "accept-edits" | "default" | "plan"
 
 export type RequestKind = "primary" | "compaction" | "generate"
 
+export type CodeModeSetting = boolean | "auto"
+
 export type AcpAuthMethodId =
   | "oauth-personal"
   | "oauth-business"
@@ -34,7 +36,11 @@ export interface AgySettings {
   readonly binaryPath?: string
   readonly defaultMode: AcpMode
   readonly forwardInstructions: boolean
-  readonly codeMode: boolean
+  readonly codeMode: CodeModeSetting
+  readonly prewarm: boolean
+  readonly maxSystemPromptChars: number
+  readonly extraRelayedTools: readonly string[]
+  readonly blockedRelayedTools: readonly string[]
   readonly includeDefaultCustomizations: boolean
   readonly startupTimeoutMs: number
   readonly chunkTimeoutMs: number
@@ -49,7 +55,11 @@ export interface AgySettings {
 export const DEFAULT_SETTINGS: AgySettings = {
   defaultMode: "auto",
   forwardInstructions: true,
-  codeMode: false,
+  codeMode: "auto",
+  prewarm: true,
+  maxSystemPromptChars: 120_000,
+  extraRelayedTools: [],
+  blockedRelayedTools: [],
   includeDefaultCustomizations: false,
   startupTimeoutMs: 30_000,
   chunkTimeoutMs: 120_000,
@@ -94,6 +104,22 @@ function readAcpMode(value: unknown): AcpMode | undefined {
   return undefined
 }
 
+function readCodeMode(value: unknown): CodeModeSetting | undefined {
+  if (typeof value === "boolean") return value
+  if (typeof value === "string") {
+    const norm = value.trim().toLowerCase()
+    if (norm === "auto") return "auto"
+    const bool = readBool(norm)
+    if (bool !== undefined) return bool
+  }
+  return undefined
+}
+
+function readStringArray(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+}
+
 export function resolveSettings(
   providerOptions?: Record<string, unknown>,
   env: NodeJS.ProcessEnv = process.env,
@@ -108,9 +134,10 @@ export function resolveSettings(
     (typeof rawSettings.traceLogPath === "string" && rawSettings.traceLogPath.trim()) ||
     (typeof env.AGY_ACP_TRACE_LOG === "string" && env.AGY_ACP_TRACE_LOG.trim()) ||
     base.traceLogPath
-  const extraDirs = Array.isArray(rawSettings.extraDirs)
-    ? rawSettings.extraDirs.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-    : base.extraDirs
+  const extraDirs = readStringArray(rawSettings.extraDirs) ?? base.extraDirs
+  const extraRelayedTools = readStringArray(rawSettings.extraRelayedTools) ?? base.extraRelayedTools
+  const blockedRelayedTools =
+    readStringArray(rawSettings.blockedRelayedTools) ?? base.blockedRelayedTools
 
   return {
     binaryPath,
@@ -119,7 +146,14 @@ export function resolveSettings(
       readBool(rawSettings.forwardInstructions) ??
       readBool(env.AGY_ACP_FORWARD_INSTRUCTIONS) ??
       base.forwardInstructions,
-    codeMode: readBool(rawSettings.codeMode) ?? readBool(env.AGY_ACP_CODE_MODE) ?? base.codeMode,
+    codeMode: readCodeMode(rawSettings.codeMode) ?? readCodeMode(env.AGY_ACP_CODE_MODE) ?? base.codeMode,
+    prewarm: readBool(rawSettings.prewarm) ?? readBool(env.AGY_ACP_PREWARM) ?? base.prewarm,
+    maxSystemPromptChars:
+      readPositiveInt(rawSettings.maxSystemPromptChars) ??
+      readPositiveInt(env.AGY_ACP_MAX_SYSTEM_PROMPT_CHARS) ??
+      base.maxSystemPromptChars,
+    extraRelayedTools,
+    blockedRelayedTools,
     includeDefaultCustomizations:
       readBool(rawSettings.includeDefaultCustomizations) ??
       readBool(env.AGY_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS) ??

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import { isRecord } from "../types.js"
 import { stripUnsafeInternalLines } from "./history.js"
 
-const MAX_SYSTEM_PROMPT_APPEND_CHARS = 120_000
+const DEFAULT_SYSTEM_PROMPT_APPEND_CHARS = 120_000
 
 // Antigravity supplies its own date and workspace environment; avoid duplicating OpenCode's copies.
 const SUPPLIED_BY_AGY = new Set(["core/date", "core/environment"])
@@ -70,10 +70,26 @@ export function extractOpenCodeInstructions(params: {
   readonly agentName?: string
   readonly agentSystem?: string
   readonly codeModeEnabled?: boolean
+  readonly relayedToolNames?: readonly string[]
 }): string | undefined {
   const codeModeEnabled = params.codeModeEnabled ?? false
   const sections: string[] = []
   const seen = new Set<string>()
+
+  if (codeModeEnabled && params.relayedToolNames && params.relayedToolNames.length > 0) {
+    const lines = ["# OpenCode Relayed Tools (MCP `oc`)"]
+    if (params.relayedToolNames.includes("execute")) {
+      lines.push(
+        "- OpenCode's Code Mode `execute` tool is callable here as `mcp_oc_execute` (always invoke `mcp_oc_execute`, not bare `execute`).",
+      )
+    }
+    lines.push(
+      `- Relayed OpenCode tools exposed with the \`mcp_oc_\` prefix: ${params.relayedToolNames
+        .map((n) => `\`mcp_oc_${n}\``)
+        .join(", ")}`,
+    )
+    sections.push(lines.join("\n"))
+  }
 
   const cleanAgentSystem = params.agentSystem
     ? stripInternalOpencodeNamespace(params.agentSystem)
@@ -108,13 +124,16 @@ export function extractOpenCodeInstructions(params: {
 export function buildSystemPromptAppend(params: {
   readonly rawInstructions?: string
   readonly forwardInstructions: boolean
+  readonly maxChars?: number
 }): string | undefined {
   if (!params.forwardInstructions) return undefined
   const trimmed = params.rawInstructions?.trim()
   if (!trimmed) return undefined
-  if (trimmed.length <= MAX_SYSTEM_PROMPT_APPEND_CHARS) return trimmed
+  const maxChars = params.maxChars ?? DEFAULT_SYSTEM_PROMPT_APPEND_CHARS
+  if (trimmed.length <= maxChars) return trimmed
   const suffix = "\n...[truncated]"
-  return trimmed.slice(0, MAX_SYSTEM_PROMPT_APPEND_CHARS - suffix.length) + suffix
+  if (maxChars <= suffix.length) return trimmed.slice(0, Math.max(0, maxChars))
+  return trimmed.slice(0, maxChars - suffix.length) + suffix
 }
 
 /** Compute a short deterministic digest for system prompt append text. */

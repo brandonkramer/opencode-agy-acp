@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { AssistantMessage, UserMessage } from "@opencode/ai/effect"
 import type { Model, Provider } from "@opencode/plugin/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
@@ -14,6 +14,15 @@ import plugin from "../src/index.js"
 import { OPENCODE_QUESTION_TOOL, PACKAGE_ID, PROVIDER_ID } from "../src/types.js"
 
 describe("Plugin.define hook wiring (src/index.ts)", () => {
+  let prevPrewarm: string | undefined
+  beforeEach(() => {
+    prevPrewarm = process.env.AGY_ACP_PREWARM
+    process.env.AGY_ACP_PREWARM = "false"
+  })
+  afterEach(() => {
+    if (prevPrewarm === undefined) delete process.env.AGY_ACP_PREWARM
+    else process.env.AGY_ACP_PREWARM = prevPrewarm
+  })
   test("registers provider, aisdk, context, model.request, title, retry:false, rpc, and finalizer", async () => {
     const store = new Map<string, unknown>()
     const providers = new Map<string, { info: Provider.Info; models: readonly Model.Info[] }>()
@@ -140,7 +149,7 @@ describe("Plugin.define hook wiring (src/index.ts)", () => {
       await Effect.runPromise(retryHook!(retryEvent))
       expect(retryEvent.decision).toEqual({ retry: false })
 
-      // 3. Context hook: Pure ACP clears system and retains only `question` tool
+      // 3. Context hook: codeMode="auto" stays Pure ACP when only shadowed tools exist (retains only `question`)
       const contextHook = sessionHooks.get("context")?.[0]
       expect(contextHook).toBeDefined()
       const acpContext: SessionContext = {
@@ -155,12 +164,25 @@ describe("Plugin.define hook wiring (src/index.ts)", () => {
         tools: {
           bash: { description: "Run shell", input: {} },
           [OPENCODE_QUESTION_TOOL]: { description: "Ask", input: {} },
-          subagent: { description: "Subagent", input: {} },
         },
       }
       await Effect.runPromise(contextHook!(acpContext))
       expect(acpContext.system).toEqual([])
       expect(Object.keys(acpContext.tools)).toEqual([OPENCODE_QUESTION_TOOL])
+
+      // 3b. codeMode="auto" auto-enables Code Mode when non-shadowed tools like `subagent` are present
+      const hybridAutoCtx: SessionContext = {
+        ...acpContext,
+        sessionID: "ses_hook_hybrid" as never,
+        system: [{ type: "system", text: "outer" } as never],
+        tools: {
+          bash: { description: "Run shell", input: {} },
+          [OPENCODE_QUESTION_TOOL]: { description: "Ask", input: {} },
+          subagent: { description: "Subagent", input: {} },
+        },
+      }
+      await Effect.runPromise(contextHook!(hybridAutoCtx))
+      expect(Object.keys(hybridAutoCtx.tools)).toEqual(["bash", OPENCODE_QUESTION_TOOL, "subagent"])
 
       // 4. Context hook: non-ACP provider sanitizes acp_* hosted tools
       const nonAcpContext: SessionContext = {

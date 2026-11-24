@@ -5,6 +5,7 @@ import type { SessionRequestMessage } from "@opencode/plugin/effect/session"
 import {
   buildTextOnlyHandoffPromptBlocks,
   buildThinAcpPromptBlocks,
+  formatToolResultOutput,
   hasUnseenNonAcpAssistantHistory,
   isInlineBase64,
   isSyntheticRestartAfterError,
@@ -120,5 +121,23 @@ describe("history sanitizer & prompt builders", () => {
       { role: "user", content: [{ type: "text", text: "The server restarted while you were working." }] },
     ]
     expect(isSyntheticRestartAfterError(prompt)).toBe(true)
+  })
+
+  test("formatToolResultOutput preserves image-data and image file-data for MCP relay", () => {
+    const imgRes = formatToolResultOutput({
+      type: "content",
+      value: [
+        { type: "text", text: "captured screenshot" },
+        { type: "image-data", data: "aGVsbG8=", mediaType: "image/png" },
+        { type: "file-data", data: "d29ybGQ=", mediaType: "image/jpeg", filename: "shot.jpg" },
+      ],
+    })
+    expect(imgRes.isError).toBe(false)
+    expect(imgRes.text).toContain("captured screenshot")
+    expect(imgRes.content).toEqual([
+      { type: "text", text: "captured screenshot" },
+      { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+      { type: "image", data: "d29ybGQ=", mimeType: "image/jpeg" },
+    ])
   })
 })

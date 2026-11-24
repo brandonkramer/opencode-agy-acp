@@ -13,7 +13,7 @@ import {
   type AcpUsagePayload,
 } from "../types.js"
 import { API_ERROR_ABORT_PATTERN } from "./history.js"
-import type { McpCallToolResult } from "./mcp-relay.js"
+import type { McpCallToolResult, McpContentItem } from "./mcp-relay.js"
 import type { OpenCodeQuestion } from "./question.js"
 
 const TERMINAL_TOOL_STATUSES = new Set([
@@ -239,7 +239,14 @@ export class ActiveTurn {
   }
 
   resumeWithToolResults(
-    matchedResults: ReadonlyMap<string, { readonly text: string; readonly isError: boolean }>,
+    matchedResults: ReadonlyMap<
+      string,
+      {
+        readonly text: string
+        readonly content?: readonly McpContentItem[]
+        readonly isError: boolean
+      }
+    >,
   ): void {
     this.drainBufferedParts()
     for (const callId of [...this.dispatchedCallIds]) {
@@ -258,7 +265,10 @@ export class ActiveTurn {
           isError: true,
         }
         pending.resolve({
-          content: [{ type: "text", text: res.text }],
+          content:
+            res.content && res.content.length > 0
+              ? res.content
+              : [{ type: "text", text: res.text }],
           isError: res.isError,
         })
       } else {
@@ -370,7 +380,7 @@ export class ActiveTurn {
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined
       this.tryFlush(false)
-    }, immediate ? 0 : 60)
+    }, immediate ? 0 : 15)
     this.flushTimer.unref?.()
   }
 

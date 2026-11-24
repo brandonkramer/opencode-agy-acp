@@ -110,6 +110,22 @@ export interface SessionRegistryOptions {
   readonly onStateChanged?: (sessionID: string) => void
 }
 
+interface WarmStandby {
+  readonly proc: AcpProcess
+  readonly cwd: string
+  readonly spawnSignature: string
+  readonly ready: Promise<void>
+  idleTimer?: ReturnType<typeof setTimeout>
+}
+
+interface SideCallWorker {
+  readonly proc: AcpProcess
+  readonly spawnSignature: string
+  readonly ready: Promise<void>
+  activeCalls: number
+  idleTimer?: ReturnType<typeof setTimeout>
+}
+
 export class SessionRegistry {
   readonly mcpRelay: McpRelayServer
   private baseSettings: AgySettings
@@ -117,6 +133,9 @@ export class SessionRegistry {
   private readonly activeProcs = new Set<AcpProcess>()
   private readonly intentionallyDisposed = new WeakSet<AcpProcess>()
   private readonly cooldownsByBucket = new Map<CooldownBucket, { until: number; reason: string }>()
+  private readonly sideCallWorkerLock = Semaphore.makeUnsafe(1)
+  private standby?: WarmStandby
+  private sideCallWorker?: SideCallWorker
   private catalog: readonly AcpDiscoveredModel[] = FALLBACK_MODELS
   private catalogUpdatedAt = 0
   private catalogDiscoveryPromise?: Promise<readonly AcpDiscoveredModel[]>
@@ -139,11 +158,22 @@ export class SessionRegistry {
     return this.baseSettings
   }
 
+  private spawnSignatureFor(settings: AgySettings): string {
+    return JSON.stringify([
+      settings.binaryPath ?? "",
+      settings.includeDefaultCustomizations,
+      settings.extraDirs,
+      settings.traceLogPath ?? "",
+    ])
+  }
+
   updateBaseSettings(settings: AgySettings): void {
     this.baseSettings = settings
     for (const entry of this.entries.values()) {
       if (!entry.codeModeExplicit) {
-        entry.codeModeEnabled = settings.codeMode
+        entry.codeModeEnabled = entry.contextSnapshot
+          ? this.resolveContextTools(entry.sessionID, entry.contextSnapshot.tools, settings).codeModeEnabled
+          : settings.codeMode === true
       }
       if (!entry.modeExplicit) {
         entry.mode = entry.contextSnapshot?.agent === "plan" ? "plan" : settings.defaultMode
@@ -168,7 +198,7 @@ export class SessionRegistry {
         cwd: this.ctx.location.directory,
         mode: this.baseSettings.defaultMode,
         modeExplicit: false,
-        codeModeEnabled: this.baseSettings.codeMode,
+        codeModeEnabled: this.baseSettings.codeMode === true,
         codeModeExplicit: false,
         lastError: null,
         generation: 0,
@@ -176,6 +206,203 @@ export class SessionRegistry {
       this.entries.set(sessionID, entry)
     }
     return entry
+  }
+
+  private async disposeStandby(): Promise<void> {
+    const sb = this.standby
+    this.standby = undefined
+    if (!sb) return
+    if (sb.idleTimer) clearTimeout(sb.idleTimer)
+    this.intentionallyDisposed.add(sb.proc)
+    this.activeProcs.delete(sb.proc)
+    if (!sb.proc.isClosed) {
+      await sb.proc.dispose().catch(() => {})
+    }
+  }
+
+  prewarmStandby(runtimeSettings: AgySettings = this.baseSettings): void {
+    if (this.disposed || !runtimeSettings.prewarm || this.standby || this.activeProcs.size >= 4) {
+      return
+    }
+    const cwd = this.ctx.location.directory
+    const spawnSignature = this.spawnSignatureFor(runtimeSettings)
+    const spawned = new AcpProcess({
+      cwd,
+      binaryPath: runtimeSettings.binaryPath,
+      processPerSession: false,
+      includeDefaultCustomizations: runtimeSettings.includeDefaultCustomizations,
+      dangerouslySkipPermissions: false,
+      extraDirs: runtimeSettings.extraDirs,
+      traceLogPath: runtimeSettings.traceLogPath,
+      io: this.options.io,
+      onExit: () => {
+        this.activeProcs.delete(spawned)
+        if (this.standby?.proc === spawned) {
+          if (this.standby.idleTimer) clearTimeout(this.standby.idleTimer)
+          this.standby = undefined
+        }
+      },
+    })
+    this.activeProcs.add(spawned)
+    const ready = (async () => {
+      await spawned.initialize(runtimeSettings.startupTimeoutMs)
+      await spawned.authenticate(runtimeSettings.startupTimeoutMs)
+    })().catch(async () => {
+      this.intentionallyDisposed.add(spawned)
+      this.activeProcs.delete(spawned)
+      if (this.standby?.proc === spawned) {
+        if (this.standby.idleTimer) clearTimeout(this.standby.idleTimer)
+        this.standby = undefined
+      }
+      await spawned.dispose().catch(() => {})
+    })
+
+    const record: WarmStandby = {
+      proc: spawned,
+      cwd,
+      spawnSignature,
+      ready,
+    }
+    const idleMs = runtimeSettings.idleTimeoutMs
+    if (idleMs > 0) {
+      record.idleTimer = setTimeout(() => {
+        if (this.standby === record) {
+          void this.disposeStandby()
+        }
+      }, idleMs)
+      record.idleTimer.unref?.()
+    }
+    this.standby = record
+  }
+
+  private async claimStandby(cwd: string, runtimeSettings: AgySettings): Promise<AcpProcess | undefined> {
+    const sb = this.standby
+    if (!sb) return undefined
+    if (sb.cwd !== cwd || sb.spawnSignature !== this.spawnSignatureFor(runtimeSettings) || sb.proc.isClosed) {
+      return undefined
+    }
+    this.standby = undefined
+    if (sb.idleTimer) clearTimeout(sb.idleTimer)
+    await sb.ready
+    if (this.disposed || sb.proc.isClosed) {
+      this.intentionallyDisposed.add(sb.proc)
+      this.activeProcs.delete(sb.proc)
+      await sb.proc.dispose().catch(() => {})
+      return undefined
+    }
+    if (runtimeSettings.prewarm) {
+      this.prewarmStandby(runtimeSettings)
+    }
+    return sb.proc
+  }
+
+  private async disposeSideCallWorker(): Promise<void> {
+    const worker = this.sideCallWorker
+    this.sideCallWorker = undefined
+    if (!worker) return
+    if (worker.idleTimer) clearTimeout(worker.idleTimer)
+    this.intentionallyDisposed.add(worker.proc)
+    this.activeProcs.delete(worker.proc)
+    if (!worker.proc.isClosed) {
+      await worker.proc.dispose().catch(() => {})
+    }
+  }
+
+  private async acquireSideCallWorker(
+    cwd: string,
+    runtimeSettings: AgySettings,
+  ): Promise<SideCallWorker> {
+    const sig = this.spawnSignatureFor(runtimeSettings)
+    const worker = await Effect.runPromise(
+      this.sideCallWorkerLock.withPermit(
+        Effect.promise(async () => {
+          const existing = this.sideCallWorker
+          if (existing && !existing.proc.isClosed && existing.spawnSignature === sig) {
+            if (existing.idleTimer) {
+              clearTimeout(existing.idleTimer)
+              existing.idleTimer = undefined
+            }
+            existing.activeCalls++
+            return existing
+          }
+          if (existing && existing.activeCalls === 0) {
+            await this.disposeSideCallWorker()
+          }
+
+          const spawned = new AcpProcess({
+            cwd,
+            binaryPath: runtimeSettings.binaryPath,
+            processPerSession: false,
+            includeDefaultCustomizations: runtimeSettings.includeDefaultCustomizations,
+            dangerouslySkipPermissions: false,
+            extraDirs: runtimeSettings.extraDirs,
+            traceLogPath: runtimeSettings.traceLogPath,
+            io: this.options.io,
+            // Side calls (judge / compaction) must stay read-only and never prompt for writes.
+            onPermissionRequest: async () => ({ outcome: "cancelled" }),
+            onElicitation: async () => ({ action: "decline" }),
+            onExit: () => {
+              this.activeProcs.delete(spawned)
+              if (this.sideCallWorker?.proc === spawned) {
+                if (this.sideCallWorker.idleTimer) clearTimeout(this.sideCallWorker.idleTimer)
+                this.sideCallWorker = undefined
+              }
+            },
+          })
+          this.activeProcs.add(spawned)
+          const ready = (async () => {
+            await spawned.initialize(runtimeSettings.startupTimeoutMs)
+            await spawned.authenticate(runtimeSettings.startupTimeoutMs)
+          })()
+          const created: SideCallWorker = {
+            proc: spawned,
+            spawnSignature: sig,
+            ready,
+            activeCalls: 1,
+          }
+          if (!this.sideCallWorker) {
+            this.sideCallWorker = created
+          }
+          return created
+        }),
+      ),
+    )
+
+    try {
+      await worker.ready
+      return worker
+    } catch (err) {
+      await this.releaseSideCallWorker(worker, true)
+      throw err
+    }
+  }
+
+  private async releaseSideCallWorker(worker: SideCallWorker, forceDispose = false): Promise<void> {
+    worker.activeCalls = Math.max(0, worker.activeCalls - 1)
+    if (forceDispose || this.disposed || worker.proc.isClosed || this.sideCallWorker !== worker) {
+      if (this.sideCallWorker === worker) {
+        this.sideCallWorker = undefined
+      }
+      if (worker.idleTimer) clearTimeout(worker.idleTimer)
+      this.intentionallyDisposed.add(worker.proc)
+      this.activeProcs.delete(worker.proc)
+      if (!worker.proc.isClosed) {
+        await worker.proc.dispose().catch(() => {})
+      }
+      return
+    }
+    if (worker.activeCalls === 0) {
+      const idleMs = this.baseSettings.idleTimeoutMs
+      if (idleMs > 0) {
+        if (worker.idleTimer) clearTimeout(worker.idleTimer)
+        worker.idleTimer = setTimeout(() => {
+          if (this.sideCallWorker === worker && worker.activeCalls === 0) {
+            void this.disposeSideCallWorker()
+          }
+        }, idleMs)
+        worker.idleTimer.unref?.()
+      }
+    }
   }
 
   private effectiveModeFor(
@@ -338,6 +565,36 @@ export class SessionRegistry {
     } catch {}
   }
 
+  resolveContextTools(
+    sessionID: string,
+    tools: Record<string, { readonly description: string; readonly input: unknown }>,
+    settingsOverride?: AgySettings,
+  ): {
+    readonly codeModeEnabled: boolean
+    readonly relayedToolNames: readonly string[]
+    readonly mcpDescriptors: McpToolDescriptor[]
+    readonly mcpSafeToOriginal: Map<string, string>
+  } {
+    const entry = this.getOrCreateEntry(sessionID)
+    const runtime = settingsOverride ?? this.baseSettings
+    const { mcpDescriptors, mcpSafeToOriginal } = buildToolDescriptors(tools, {
+      extraRelayedTools: runtime.extraRelayedTools,
+      blockedRelayedTools: runtime.blockedRelayedTools,
+    })
+    const codeModeEnabled = entry.codeModeExplicit
+      ? entry.codeModeEnabled
+      : runtime.codeMode === "auto"
+        ? mcpDescriptors.length > 0
+        : runtime.codeMode
+
+    return {
+      codeModeEnabled,
+      relayedToolNames: codeModeEnabled ? mcpDescriptors.map((d) => d.name) : [],
+      mcpDescriptors: codeModeEnabled ? mcpDescriptors : [],
+      mcpSafeToOriginal: codeModeEnabled ? mcpSafeToOriginal : new Map<string, string>(),
+    }
+  }
+
   updateContextSnapshot(
     sessionID: string,
     input: {
@@ -350,17 +607,14 @@ export class SessionRegistry {
     if (!entry.modeExplicit) {
       entry.mode = input.agent === "plan" ? "plan" : this.baseSettings.defaultMode
     }
+    const resolved = this.resolveContextTools(sessionID, input.tools)
+    if (!entry.codeModeExplicit) {
+      entry.codeModeEnabled = resolved.codeModeEnabled
+    }
     const systemPromptHash = hashSystemPrompt(input.rawInstructions)
-    const toolSignature = Object.entries(input.tools)
-      .map(([name, info]) => {
-        let schema: string
-        try {
-          schema = JSON.stringify(info.input ?? null) ?? "null"
-        } catch {
-          schema = String(typeof info.input)
-        }
-        return `${name}\0${info.description ?? ""}\0${schema}`
-      })
+    // Hash only the post-filter relayed MCP tools so shadowed OpenCode tool changes don't reset ACP.
+    const toolSignature = resolved.mcpDescriptors
+      .map((d) => `${d.name}\0${d.description}\0${JSON.stringify(d.inputSchema)}`)
       .sort()
       .join("\0")
 
@@ -368,23 +622,20 @@ export class SessionRegistry {
     if (
       prev &&
       prev.agent === input.agent &&
-      prev.codeModeEnabled === entry.codeModeEnabled &&
+      prev.codeModeEnabled === resolved.codeModeEnabled &&
       prev.toolSignature === toolSignature &&
       prev.systemPromptHash === systemPromptHash
     ) {
       return
     }
-    const { mcpDescriptors, mcpSafeToOriginal } = entry.codeModeEnabled
-      ? buildToolDescriptors(input.tools)
-      : { mcpDescriptors: [], mcpSafeToOriginal: new Map<string, string>() }
 
     entry.contextSnapshot = {
       agent: input.agent,
-      codeModeEnabled: entry.codeModeEnabled,
+      codeModeEnabled: resolved.codeModeEnabled,
       toolSignature,
       tools: input.tools,
-      mcpDescriptors,
-      mcpSafeToOriginal,
+      mcpDescriptors: resolved.mcpDescriptors,
+      mcpSafeToOriginal: resolved.mcpSafeToOriginal,
       rawInstructions: input.rawInstructions,
       systemPromptHash,
     }
@@ -467,7 +718,7 @@ export class SessionRegistry {
     return {
       sessionID,
       mode: entry ? this.effectiveModeFor(entry, this.baseSettings) : this.baseSettings.defaultMode,
-      codeModeEnabled: entry?.codeModeEnabled ?? this.baseSettings.codeMode,
+      codeModeEnabled: entry?.codeModeEnabled ?? (this.baseSettings.codeMode === true),
       starting: false,
       acpSessionId: entry?.acpSessionId ?? null,
       connected: Boolean(entry?.proc && !entry.proc.isClosed && entry.acpSessionId),
@@ -485,7 +736,7 @@ export class SessionRegistry {
       sessionID,
       acpSessionId: entry?.acpSessionId ?? null,
       mode: entry ? this.effectiveModeFor(entry, this.baseSettings) : this.baseSettings.defaultMode,
-      codeModeEnabled: entry?.codeModeEnabled ?? this.baseSettings.codeMode,
+      codeModeEnabled: entry?.codeModeEnabled ?? (this.baseSettings.codeMode === true),
       connected: Boolean(entry?.proc && !entry.proc.isClosed && entry.acpSessionId),
       busy: Boolean(entry?.activeTurn),
       watchdogPaused: entry?.proc?.isWatchdogPaused ?? false,
@@ -524,10 +775,14 @@ export class SessionRegistry {
     entry.codeModeExplicit = true
     if (entry.contextSnapshot) {
       const { mcpDescriptors, mcpSafeToOriginal } = codeModeEnabled
-        ? buildToolDescriptors(entry.contextSnapshot.tools)
+        ? buildToolDescriptors(entry.contextSnapshot.tools, {
+            extraRelayedTools: this.baseSettings.extraRelayedTools,
+            blockedRelayedTools: this.baseSettings.blockedRelayedTools,
+          })
         : { mcpDescriptors: [], mcpSafeToOriginal: new Map<string, string>() }
       entry.contextSnapshot = {
         ...entry.contextSnapshot,
+        codeModeEnabled,
         mcpDescriptors,
         mcpSafeToOriginal,
       }
@@ -730,13 +985,25 @@ export class SessionRegistry {
       }
     }
 
-    // Reuse live proc if still alive after softResetForHandoff; otherwise spawn fresh.
+    // Reuse live proc if still alive after softResetForHandoff; else adopt warm standby or spawn fresh.
     let proc = entry.proc && !entry.proc.isClosed ? entry.proc : undefined
+    if (!proc) {
+      const standbyProc = await this.claimStandby(entry.cwd, runtimeSettings)
+      if (standbyProc) {
+        standbyProc.setHandlers({
+          onUpdate: (_sid, update) => this.handleAcpUpdate(entry, update),
+          onPermissionRequest: (params) => this.handlePermissionRequest(entry, params),
+          onElicitation: (params) => this.handleElicitation(entry, params),
+          onExit: (code, signal, tail) => this.handleProcExit(entry, standbyProc, code, signal, tail),
+        })
+        proc = standbyProc
+      }
+    }
     if (!proc) {
       const spawned = new AcpProcess({
         cwd: entry.cwd,
         binaryPath: runtimeSettings.binaryPath,
-        processPerSession: entry.codeModeEnabled,
+        processPerSession: false,
         includeDefaultCustomizations: runtimeSettings.includeDefaultCustomizations,
         dangerouslySkipPermissions: false,
         extraDirs: runtimeSettings.extraDirs,
@@ -933,7 +1200,10 @@ export class SessionRegistry {
     const result = await turn.enqueueQuestion(bridged.questions, params.toolCallId)
     if (result.isError) return { action: "cancel" }
     const answers = parseQuestionToolAnswers(
-      result.content.map((c) => c.text).join("\n"),
+      result.content
+        .filter((c): c is { readonly type: "text"; readonly text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n"),
       bridged.questions,
     )
     if (!answers) return { action: "cancel" }
@@ -1043,8 +1313,11 @@ export class SessionRegistry {
     const entry = this.getOrCreateEntry(input.sessionID)
     this.clearIdleTimer(entry)
     const runtimeSettings = input.runtimeSettings ?? this.baseSettings
-    if (!entry.codeModeExplicit && runtimeSettings.codeMode !== entry.codeModeEnabled) {
-      entry.codeModeEnabled = runtimeSettings.codeMode
+    if (!entry.codeModeExplicit) {
+      entry.codeModeEnabled = entry.contextSnapshot
+        ? this.resolveContextTools(entry.sessionID, entry.contextSnapshot.tools, runtimeSettings)
+            .codeModeEnabled
+        : runtimeSettings.codeMode === true
     }
 
     // Immediate continuation path when OpenCode finishes executing parked MCP / question calls.
@@ -1122,6 +1395,7 @@ export class SessionRegistry {
             const systemPromptAppend = buildSystemPromptAppend({
               rawInstructions: entry.contextSnapshot?.rawInstructions,
               forwardInstructions: runtimeSettings.forwardInstructions,
+              maxChars: runtimeSettings.maxSystemPromptChars,
             })
             const systemPromptHash = hashSystemPrompt(systemPromptAppend)
 
@@ -1342,39 +1616,56 @@ export class SessionRegistry {
       } catch {}
     }
 
-    let proc: AcpProcess | undefined
+    let worker: SideCallWorker
+    try {
+      worker = await this.acquireSideCallWorker(cwd, runtimeSettings)
+    } catch (err) {
+      if (err instanceof AgyNotFoundError || (err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return this.createImmediateTextStream(
+          err instanceof Error ? err.message : String(err),
+          "agy_unavailable",
+        )
+      }
+      throw err
+    }
+
+    const activeProc = worker.proc
     let sideSessionId: string | undefined
+    let unregisterUpdate: (() => void) | undefined
     let cleanedUp = false
-    const cleanup = () => {
+    const cleanup = (opts?: { readonly cancel?: boolean; readonly disposeWorker?: boolean }) => {
       if (cleanedUp) return
       cleanedUp = true
-      if (!proc) return
-      const targetProc = proc
-      this.intentionallyDisposed.add(targetProc)
-      this.activeProcs.delete(targetProc)
-      if (!targetProc.isClosed && sideSessionId) {
-        targetProc.notifyCancel(sideSessionId)
+      unregisterUpdate?.()
+      unregisterUpdate = undefined
+      if (sideSessionId) {
+        const sid = sideSessionId
+        sideSessionId = undefined
+        if (opts?.cancel && !activeProc.isClosed) {
+          activeProc.notifyCancel(sid)
+        }
+        void activeProc.closeSession(sid).catch(() => {})
       }
-      void targetProc.dispose().catch(() => {})
+      void this.releaseSideCallWorker(worker, opts?.disposeWorker ?? false)
     }
 
     const turn = new ActiveTurn({
-      pauseWatchdog: () => proc?.pauseWatchdog(),
-      resumeWatchdog: () => proc?.resumeWatchdog(),
+      pauseWatchdog: () => activeProc.pauseWatchdog(),
+      resumeWatchdog: () => activeProc.resumeWatchdog(),
       nativeFlushGraceMs: runtimeSettings.nativeFlushGraceMs,
       getKnownRelayedNames: () => new Set<string>(),
       onInterruptRequested: (reason) => {
-        cleanup()
+        cleanup({ cancel: true, disposeWorker: false })
         turn.finishWithError(new Error(reason))
       },
-      onTurnSettled: () => cleanup(),
+      onTurnSettled: () => cleanup({ cancel: false, disposeWorker: false }),
       onApiErrorText: (text) => {
         if (isGlobalBreakerError(text)) {
           this.tripCircuitBreaker(text, "global")
         } else {
           this.tripCircuitBreaker(text, quotaBucketForModel(input.modelID))
         }
-        cleanup()
+        cleanup({ cancel: true, disposeWorker: isGlobalBreakerError(text) })
         turn.finishCleanStop(
           `Antigravity ACP halted side call on upstream error:\n${text.trim()}`,
           "api_error_halted",
@@ -1383,31 +1674,8 @@ export class SessionRegistry {
       },
     })
 
-    proc = new AcpProcess({
-      cwd,
-      binaryPath: runtimeSettings.binaryPath,
-      processPerSession: false,
-      includeDefaultCustomizations: runtimeSettings.includeDefaultCustomizations,
-      dangerouslySkipPermissions: false,
-      extraDirs: runtimeSettings.extraDirs,
-      traceLogPath: runtimeSettings.traceLogPath,
-      io: this.options.io,
-      onUpdate: (_sid, update) => turn.handleUpdate(update),
-      onExit: (code, signal, tail) => {
-        if (proc) this.activeProcs.delete(proc)
-        if (cleanedUp || this.disposed || (proc && this.intentionallyDisposed.has(proc))) return
-        const lastLine = tail.split("\n").filter(Boolean).at(-1)
-        turn.finishWithError(
-          new Error(`agy acp exited during ${input.requestKind} (code=${code}, signal=${signal})${lastLine ? `: ${lastLine}` : ""}`),
-        )
-      },
-    })
-    this.activeProcs.add(proc)
-
     try {
-      await proc.initialize(runtimeSettings.startupTimeoutMs)
-      await proc.authenticate(runtimeSettings.startupTimeoutMs)
-      const res = await proc.newSession({
+      const res = await activeProc.newSession({
         cwd,
         mcpServers: [],
         timeoutMs: runtimeSettings.startupTimeoutMs,
@@ -1416,26 +1684,31 @@ export class SessionRegistry {
         throw new Error(`Antigravity ACP did not return a sessionId for ${input.requestKind}`)
       }
       sideSessionId = String(res.sessionId)
+      unregisterUpdate = activeProc.registerSessionUpdateHandler(sideSessionId, (update) =>
+        turn.handleUpdate(update),
+      )
       const target = resolveAcpModelTarget(this.catalog, input.modelID, input.variant)
       try {
-        await proc.setModel(sideSessionId, target.acpModelId)
+        await activeProc.setModel(sideSessionId, target.acpModelId)
       } catch {
-        await proc.setConfigOption(sideSessionId, "model", target.baseModelId).catch(() => {})
+        await activeProc.setConfigOption(sideSessionId, "model", target.baseModelId).catch(() => {})
         if (target.thoughtLevel) {
-          await proc
+          await activeProc
             .setConfigOption(sideSessionId, "thought_level", target.thoughtLevel)
             .catch(() => {})
         }
       }
     } catch (err) {
-      cleanup()
+      cleanup({ cancel: false, disposeWorker: activeProc.isClosed })
       if (err instanceof AgyNotFoundError || (err as NodeJS.ErrnoException)?.code === "ENOENT") {
-        return this.createImmediateTextStream(err instanceof Error ? err.message : String(err), "agy_unavailable")
+        return this.createImmediateTextStream(
+          err instanceof Error ? err.message : String(err),
+          "agy_unavailable",
+        )
       }
       throw err
     }
 
-    const activeProc = proc
     const activeSid = sideSessionId
     const promptBlocks = buildSideCallPromptBlocks(input.prompt, input.requestKind)
 
@@ -1444,12 +1717,11 @@ export class SessionRegistry {
         .prompt(activeSid, promptBlocks, {
           idleWatchdogMs: runtimeSettings.chunkTimeoutMs,
         })
-        .then(async (res) => {
+        .then((res) => {
           if (turn.abortedOnApiError || this.disposed) return
           turn.promptSettled = true
           turn.promptResult = res
-          await activeProc.closeSession(activeSid).catch(() => undefined)
-          cleanup()
+          cleanup({ cancel: false, disposeWorker: false })
           if (turn.hasController) {
             turn.finalizeStop()
           }
@@ -1459,7 +1731,10 @@ export class SessionRegistry {
           turn.promptSettled = true
           const error = err instanceof Error ? err : new Error(String(err))
           turn.promptError = error
-          cleanup()
+          cleanup({
+            cancel: err instanceof AcpStallError,
+            disposeWorker: err instanceof AcpStallError || activeProc.isClosed,
+          })
           turn.finishWithError(error)
         })
     })
@@ -1560,7 +1835,10 @@ export class SessionRegistry {
       }
     }
 
-    const jobs: Promise<void>[] = []
+    const jobs: Promise<void>[] = [
+      this.disposeStandby(),
+      this.disposeSideCallWorker(),
+    ]
     for (const entry of snapshot) {
       if (entry.proc) {
         const proc = entry.proc

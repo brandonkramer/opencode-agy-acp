@@ -2,6 +2,7 @@ import type { LanguageModelV3Prompt, LanguageModelV3ToolResultOutput } from "@ai
 import { AssistantMessage, ToolMessage, UserMessage } from "@opencode/ai/effect"
 import type { SessionRequestMessage } from "@opencode/plugin/effect/session"
 import { PROVIDER_ID, isRecord, type AcpContentBlock, type QuotaBucket } from "../types.js"
+import type { McpContentItem } from "./mcp-relay.js"
 
 export const UNSAFE_INTERNAL_SIGNATURE = /\bsession_move\b|tools\.opencode\./i
 
@@ -232,6 +233,7 @@ export function sanitizeForAcpModel(messages: SessionRequestMessage[]): void {
 
 export function formatToolResultOutput(output: LanguageModelV3ToolResultOutput): {
   readonly text: string
+  readonly content?: readonly McpContentItem[]
   readonly isError: boolean
 } {
   switch (output.type) {
@@ -249,20 +251,41 @@ export function formatToolResultOutput(output: LanguageModelV3ToolResultOutput):
         isError: true,
       }
     case "content": {
-      const text = output.value
-        .map((c) => {
-          if (c.type === "text") return c.text
-          if (c.type === "file-data" || c.type === "image-data") {
-            const fname = "filename" in c ? c.filename : undefined
-            return `[Attachment ${c.mediaType}${fname ? `: ${fname}` : ""}]`
+      const items: McpContentItem[] = []
+      const textParts: string[] = []
+      let hasImage = false
+      for (const c of output.value) {
+        if (c.type === "text") {
+          items.push({ type: "text", text: c.text })
+          textParts.push(c.text)
+        } else if (c.type === "image-data") {
+          hasImage = true
+          items.push({ type: "image", data: c.data, mimeType: c.mediaType })
+          textParts.push(`[Attachment ${c.mediaType}]`)
+        } else if (c.type === "file-data") {
+          const fname = "filename" in c ? c.filename : undefined
+          const label = `[Attachment ${c.mediaType}${fname ? `: ${fname}` : ""}]`
+          if (c.mediaType.startsWith("image/") && typeof c.data === "string" && c.data.length > 0) {
+            hasImage = true
+            items.push({ type: "image", data: c.data, mimeType: c.mediaType })
+          } else {
+            items.push({ type: "text", text: label })
           }
-          if (c.type === "file-url" || c.type === "image-url") {
-            return `[Attachment URL: ${c.url}]`
-          }
-          return "[Attachment]"
-        })
-        .join("\n")
-      return { text, isError: false }
+          textParts.push(label)
+        } else if (c.type === "file-url" || c.type === "image-url") {
+          const line = `[Attachment URL: ${c.url}]`
+          items.push({ type: "text", text: line })
+          textParts.push(line)
+        } else {
+          items.push({ type: "text", text: "[Attachment]" })
+          textParts.push("[Attachment]")
+        }
+      }
+      return {
+        text: textParts.join("\n"),
+        ...(hasImage ? { content: items } : {}),
+        isError: false,
+      }
     }
   }
 }
@@ -270,8 +293,22 @@ export function formatToolResultOutput(output: LanguageModelV3ToolResultOutput):
 export function extractToolResultsFromPrompt(
   prompt: LanguageModelV3Prompt,
   expectedCallIds: ReadonlySet<string>,
-): Map<string, { readonly text: string; readonly isError: boolean }> {
-  const results = new Map<string, { readonly text: string; readonly isError: boolean }>()
+): Map<
+  string,
+  {
+    readonly text: string
+    readonly content?: readonly McpContentItem[]
+    readonly isError: boolean
+  }
+> {
+  const results = new Map<
+    string,
+    {
+      readonly text: string
+      readonly content?: readonly McpContentItem[]
+      readonly isError: boolean
+    }
+  >()
   for (let i = prompt.length - 1; i >= 0; i--) {
     const msg = prompt[i]
     if (msg.role !== "tool" && msg.role !== "assistant") continue

@@ -134,7 +134,17 @@ export function buildAgySpawnEnv(
   return env
 }
 
-export interface AcpProcessOptions {
+export interface AcpProcessHandlers {
+  readonly onUpdate?: (sessionId: string, update: AcpSessionUpdate) => void
+  readonly onPermissionRequest?: (
+    params: AcpPermissionRequestParams,
+  ) => Promise<AcpPermissionOutcome>
+  readonly onElicitation?: (params: AcpElicitationRequestParams) => Promise<AcpElicitationResponse>
+  readonly onExit?: (code: number | null, signal: NodeJS.Signals | null, stderrTail: string) => void
+  readonly onLog?: (level: "warn" | "debug", message: string, meta?: Record<string, unknown>) => void
+}
+
+export interface AcpProcessOptions extends AcpProcessHandlers {
   readonly cwd: string
   readonly binaryPath?: string
   readonly processPerSession?: boolean
@@ -143,13 +153,6 @@ export interface AcpProcessOptions {
   readonly extraDirs?: readonly string[]
   readonly traceLogPath?: string
   readonly io?: AgyIO
-  readonly onUpdate?: (sessionId: string, update: AcpSessionUpdate) => void
-  readonly onPermissionRequest?: (
-    params: AcpPermissionRequestParams,
-  ) => Promise<AcpPermissionOutcome>
-  readonly onElicitation?: (params: AcpElicitationRequestParams) => Promise<AcpElicitationResponse>
-  readonly onExit?: (code: number | null, signal: NodeJS.Signals | null, stderrTail: string) => void
-  readonly onLog?: (level: "warn" | "debug", message: string, meta?: Record<string, unknown>) => void
 }
 
 interface PendingRpc {
@@ -182,8 +185,17 @@ export class AcpProcess {
   private exitNotified = false
   private watchdog?: ActiveWatchdog
   private watchdogPauseDepth = 0
+  private handlers: AcpProcessHandlers
+  private readonly sessionUpdateHandlers = new Map<string, (update: AcpSessionUpdate) => void>()
 
   constructor(private readonly options: AcpProcessOptions) {
+    this.handlers = {
+      onUpdate: options.onUpdate,
+      onPermissionRequest: options.onPermissionRequest,
+      onElicitation: options.onElicitation,
+      onExit: options.onExit,
+      onLog: options.onLog,
+    }
     const io = options.io ?? defaultAgyIO
     const env = io.env()
     const args = ["acp", "--stdio"]
@@ -290,6 +302,22 @@ export class AcpProcess {
     return [...this.trace]
   }
 
+  setHandlers(handlers: AcpProcessHandlers): void {
+    this.handlers = { ...handlers }
+  }
+
+  registerSessionUpdateHandler(
+    sessionId: string,
+    handler: (update: AcpSessionUpdate) => void,
+  ): () => void {
+    this.sessionUpdateHandlers.set(sessionId, handler)
+    return () => {
+      if (this.sessionUpdateHandlers.get(sessionId) === handler) {
+        this.sessionUpdateHandlers.delete(sessionId)
+      }
+    }
+  }
+
   pauseWatchdog(): void {
     this.watchdogPauseDepth++
     if (this.watchdog?.timer) {
@@ -375,7 +403,7 @@ export class AcpProcess {
   private notifyExit(code: number | null, signal: NodeJS.Signals | null, tail: string): void {
     if (this.exitNotified) return
     this.exitNotified = true
-    this.options.onExit?.(code, signal, tail)
+    this.handlers.onExit?.(code, signal, tail)
   }
 
   private signalProcess(sig: NodeJS.Signals): void {
@@ -444,7 +472,7 @@ export class AcpProcess {
       parsed = JSON.parse(line)
     } catch {
       this.recordTrace("in", `malformed JSON: ${line.slice(0, 120)}`)
-      this.options.onLog?.("warn", "Ignoring malformed ACP JSON line", {
+      this.handlers.onLog?.("warn", "Ignoring malformed ACP JSON line", {
         line: line.slice(0, 300),
       })
       return
@@ -458,7 +486,7 @@ export class AcpProcess {
       const id = Number(parsed.id)
       const entry = this.pending.get(id)
       if (!entry) {
-        this.options.onLog?.("debug", "Ignoring late ACP response for removed request", {
+        this.handlers.onLog?.("debug", "Ignoring late ACP response for removed request", {
           id: parsed.id,
         })
         return
@@ -492,7 +520,13 @@ export class AcpProcess {
 
     if (parsed.method === "session/update" && isRecord(parsed.params) && isRecord(parsed.params.update)) {
       const sid = String(parsed.params.sessionId ?? "")
-      this.options.onUpdate?.(sid, parsed.params.update as AcpSessionUpdate)
+      const upd = parsed.params.update as AcpSessionUpdate
+      const scoped = this.sessionUpdateHandlers.get(sid)
+      if (scoped) {
+        scoped(upd)
+      } else {
+        this.handlers.onUpdate?.(sid, upd)
+      }
     }
   }
 
@@ -504,12 +538,12 @@ export class AcpProcess {
     if (method === "session/request_permission") {
       try {
         const permParams = (isRecord(params) ? params : {}) as AcpPermissionRequestParams
-        const outcome: AcpPermissionOutcome = this.options.onPermissionRequest
-          ? await this.options.onPermissionRequest(permParams)
+        const outcome: AcpPermissionOutcome = this.handlers.onPermissionRequest
+          ? await this.handlers.onPermissionRequest(permParams)
           : fallbackAutoSelectPermission(permParams)
         this.write({ jsonrpc: "2.0", id, result: { outcome } })
       } catch (err) {
-        this.options.onLog?.("warn", "onPermissionRequest failed; cancelling", {
+        this.handlers.onLog?.("warn", "onPermissionRequest failed; cancelling", {
           error: err instanceof Error ? err.message : String(err),
         })
         this.write({
@@ -525,11 +559,11 @@ export class AcpProcess {
       let result: AcpElicitationResponse
       try {
         const elicitParams = (isRecord(params) ? params : {}) as AcpElicitationRequestParams
-        result = this.options.onElicitation
-          ? await this.options.onElicitation(elicitParams)
+        result = this.handlers.onElicitation
+          ? await this.handlers.onElicitation(elicitParams)
           : { action: "decline" }
       } catch (err) {
-        this.options.onLog?.("warn", "onElicitation failed; cancelling", {
+        this.handlers.onLog?.("warn", "onElicitation failed; cancelling", {
           error: err instanceof Error ? err.message : String(err),
         })
         result = { action: "cancel" }

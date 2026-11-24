@@ -1,7 +1,6 @@
 import crypto from "node:crypto"
 import http from "node:http"
 import { NATIVE_SHADOWED_TOOLS, PROVIDER_ID, isRecord } from "../types.js"
-import { stripUnsafeInternalLines } from "./history.js"
 
 export interface McpToolDescriptor {
   readonly name: string
@@ -9,8 +8,12 @@ export interface McpToolDescriptor {
   readonly inputSchema: Record<string, unknown>
 }
 
+export type McpContentItem =
+  | { readonly type: "text"; readonly text: string }
+  | { readonly type: "image"; readonly data: string; readonly mimeType: string }
+
 export interface McpCallToolResult {
-  readonly content: ReadonlyArray<{ readonly type: "text"; readonly text: string }>
+  readonly content: ReadonlyArray<McpContentItem>
   readonly isError?: boolean
 }
 
@@ -57,21 +60,28 @@ function enrichMcpToolDescription(toolName: string, rawDescription: string): str
     return `${base}\n\nOpenCode agents include "explore" (read-only search/review), "general", "build", and "plan". Optional \`model\` uses "<provider>/<modelID>".`
   }
   if (toolName === "execute") {
-    return `${base}\n\nOpenCode Code Mode JavaScript runtime: call \`await tools.<namespace>.<tool>(...)\` or \`await search({ query })\` to inspect hidden MCP and workspace tool namespaces.`
+    return `${base}\n\nOpenCode Code Mode JavaScript runtime (callable in Antigravity ACP as \`mcp_oc_execute\`): call \`await tools.<namespace>.<tool>(...)\` or \`await search({ query })\` to inspect hidden MCP and workspace tool namespaces.`
   }
   return base
 }
 
 export function buildToolDescriptors(
   tools: Record<string, { readonly description: string; readonly input: unknown }>,
+  options?: {
+    readonly extraRelayedTools?: readonly string[]
+    readonly blockedRelayedTools?: readonly string[]
+  },
 ): { mcpDescriptors: McpToolDescriptor[]; mcpSafeToOriginal: Map<string, string> } {
   const used = new Set<string>()
   const mcpSafeToOriginal = new Map<string, string>()
   const mcpDescriptors: McpToolDescriptor[] = []
+  const extra = new Set(options?.extraRelayedTools ?? [])
+  const blocked = new Set(options?.blockedRelayedTools ?? [])
 
   for (const [toolName, info] of Object.entries(tools)) {
     if (toolName === PROVIDER_ID) continue
-    if (NATIVE_SHADOWED_TOOLS.has(toolName)) continue
+    if (blocked.has(toolName)) continue
+    if (NATIVE_SHADOWED_TOOLS.has(toolName) && !extra.has(toolName)) continue
     const safeName = sanitizeMcpToolName(toolName, used)
     mcpSafeToOriginal.set(safeName, toolName)
     mcpDescriptors.push({
@@ -108,6 +118,10 @@ export class McpRelayServer {
     const server: HttpServerWithConnections = http.createServer((req, res) => {
       void this.handleHttp(req, res)
     })
+    // Allow long-running OpenCode Code Mode / subagent tool calls without HTTP socket drops.
+    server.timeout = 0
+    server.requestTimeout = 0
+    server.keepAliveTimeout = 0
     this.server = server
 
     this.startPromise = new Promise<void>((resolve, reject) => {
@@ -304,7 +318,7 @@ export class McpRelayServer {
       } else if (method === "tools/list") {
         const tools = this.handlers.getTools(sessionID).map((t) => ({
           name: t.name,
-          description: stripUnsafeInternalLines(t.description || "") || `Tool: ${t.name}`,
+          description: (t.description || "").trim() || `Tool: ${t.name}`,
           inputSchema: normalizeMcpInputSchema(t.inputSchema),
         }))
         result = { tools }
