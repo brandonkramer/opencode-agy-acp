@@ -572,4 +572,147 @@ describe("Plugin.define hook wiring (src/index.ts)", () => {
       await Effect.runPromise(Scope.close(scope, Option.none() as never))
     }
   })
+
+  test("sanitizes stripped-metadata executed:true acp_* tool parts across compaction, generate, and title hooks for non-ACP OpenAI-Chat models", async () => {
+    const store = new Map<string, unknown>()
+    const providers = new Map<string, { info: Provider.Info; models: readonly Model.Info[] }>()
+    const sessionHooks = new Map<string, Array<(input: unknown) => Effect.Effect<void>>>()
+
+    store.set("antigravity-acp:model-catalog:v1", {
+      version: 1,
+      updatedAt: Date.now(),
+      models: [
+        {
+          id: "gemini-4-neon",
+          name: "Gemini 4 Neon",
+          family: "gemini-4-neon",
+          defaultAcpModelId: "gemini-4-neon-high",
+          variants: [{ id: "high", acpModelId: "gemini-4-neon-high", thoughtLevel: "high" }],
+        },
+      ],
+    })
+
+    const mockCtx = {
+      location: { directory: process.cwd() },
+      storage: {
+        get: (key: string) => Effect.sync(() => store.get(key) as never),
+        set: (key: string, value: unknown) =>
+          Effect.sync(() => {
+            store.set(key, value)
+          }),
+        remove: (key: string) =>
+          Effect.sync(() => {
+            store.delete(key)
+          }),
+      },
+      provider: {
+        get: () => Effect.fail(new Error("not found") as never),
+        reload: () => Effect.void,
+        transform: (fn: (editor: ProviderEditor) => void) =>
+          Effect.sync(() => {
+            const editor: ProviderEditor = {
+              list: () => [],
+              get: (id) => {
+                const entry = providers.get(id)
+                if (!entry) return undefined
+                return { provider: entry.info, models: new Map(entry.models.map((m) => [m.id, m])) }
+              },
+              add: (input) => {
+                providers.set(input.info.id, { info: input.info, models: input.models })
+              },
+              update: () => {},
+              remove: (id) => {
+                providers.delete(id)
+              },
+              models: { set: () => {}, update: () => {}, remove: () => {} },
+            }
+            fn(editor)
+          }),
+      },
+      aisdk: { hook: () => Effect.void },
+      session: {
+        get: () => Effect.succeed({ location: { directory: process.cwd() } } as never),
+        update: () => Effect.void,
+        hook: (name: string, fn: (input: unknown) => Effect.Effect<void>) =>
+          Effect.sync(() => {
+            const list = sessionHooks.get(name) ?? []
+            list.push(fn)
+            sessionHooks.set(name, list)
+          }),
+      },
+      permission: { assert: () => Effect.void },
+      rpc: {
+        register: () => Effect.sync(() => ({ events: { emit: () => Effect.void } }) as never),
+      },
+      event: { subscribe: () => Stream.empty },
+    } as unknown as Context
+
+    const makeStrippedReplayMessages = () => [
+      new AssistantMessage({
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            id: "tc_1",
+            name: "acp_run_command",
+            input: { cmd: "git status" },
+            providerExecuted: true,
+          },
+          {
+            type: "tool-result",
+            id: "tc_1",
+            name: "acp_run_command",
+            result: { type: "text", value: "clean tree" },
+            providerExecuted: true,
+          },
+        ],
+      }),
+    ]
+
+    const scope = Effect.runSync(Scope.make())
+    try {
+      await Effect.runPromise(plugin.effect(mockCtx).pipe(Scope.provide(scope)))
+
+      for (const hookName of ["compaction", "generate"] as const) {
+        const hook = sessionHooks.get(hookName)?.[0]
+        expect(hook).toBeDefined()
+        const evt = {
+          sessionID: "ses_cross_1" as never,
+          agent: "compaction" as never,
+          model: { providerID: "ollama-cloud" as never, id: "deepseek-v4.1-flash:1017" as never },
+          system: [],
+          messages: makeStrippedReplayMessages(),
+          options: {},
+          tools: {},
+        }
+        await Effect.runPromise(hook!(evt))
+        const msg = evt.messages[0]!
+        expect(msg.role).toBe("assistant")
+        if (msg.role === "assistant") {
+          expect(msg.content.every((p) => p.type === "text")).toBe(true)
+          expect(msg.content.some((p) => p.type === "tool-call" || p.type === "tool-result")).toBe(
+            false,
+          )
+        }
+      }
+
+      const titleHook = sessionHooks.get("title")?.[0]
+      expect(titleHook).toBeDefined()
+      const titleEvt: SessionTitle = {
+        sessionID: "ses_cross_1" as never,
+        model: { providerID: "ollama-cloud" as never, id: "deepseek-v4.1-flash:1017" as never },
+        system: [],
+        messages: makeStrippedReplayMessages(),
+        options: {},
+      }
+      await Effect.runPromise(titleHook!(titleEvt))
+      expect(titleEvt.result).toBeUndefined()
+      const tMsg = titleEvt.messages[0]!
+      if (tMsg.role === "assistant") {
+        expect(tMsg.content.every((p) => p.type === "text")).toBe(true)
+      }
+    } finally {
+      await Effect.runPromise(Scope.close(scope, Option.none() as never))
+    }
+  })
 })

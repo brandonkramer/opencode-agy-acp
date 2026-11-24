@@ -218,15 +218,16 @@ export default Plugin.define({
         { providerID },
       )
 
-      yield* ctx.session.hook(
-        "title",
-        (input) =>
-          Effect.sync(() => {
-            if (input.result) return
-            const derived = summarizeTitleFromMessages(input.messages)
-            if (derived) input.result = derived
-          }),
-        { providerID },
+      yield* ctx.session.hook("title", (input) =>
+        Effect.sync(() => {
+          if (input.model.providerID !== providerID) {
+            sanitizeForNonAcpModel(input.messages)
+            return
+          }
+          if (input.result) return
+          const derived = summarizeTitleFromMessages(input.messages)
+          if (derived) input.result = derived
+        }),
       )
 
       // Match claude-agent: agy handles upstream retries itself; outer OpenCode retries cause double-loops.

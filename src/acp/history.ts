@@ -119,8 +119,8 @@ export function sanitizeForNonAcpModel(messages: SessionRequestMessage[]): void 
         }
         const isAcpHosted =
           (part.type === "tool-call" || part.type === "tool-result") &&
-          part.providerExecuted === true &&
-          (Boolean(part.providerMetadata?.[PROVIDER_ID]) || part.name.startsWith("acp_"))
+          (part.name.startsWith("acp_") ||
+            (part.providerExecuted === true && Boolean(part.providerMetadata?.[PROVIDER_ID])))
         if (isAcpHosted) {
           changed = true
           if (part.type === "tool-call") {
