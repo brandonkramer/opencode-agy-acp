@@ -443,4 +443,106 @@ describe("SessionRegistry + fake-agy integration", () => {
     expect(plugin.id).toBe(PROVIDER_ID)
     expect(typeof plugin.effect).toBe("function")
   })
+
+  test("10. Idle reaper disposes proc while preserving sessionId, resumes cleanly, skips parked turns, and deleteSession removes storage", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-idle-"))
+    const sessionsFile = path.join(tmp, "sessions.json")
+    const eventsLog = path.join(tmp, "events.log")
+    const prevSessions = process.env.FAKE_AGY_SESSIONS_FILE
+    const prevEvents = process.env.FAKE_AGY_EVENTS_LOG
+    process.env.FAKE_AGY_SESSIONS_FILE = sessionsFile
+    process.env.FAKE_AGY_EVENTS_LOG = eventsLog
+
+    const { ctx, store } = createMockContext({ cwd: tmp })
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({ idleTimeoutMs: 70, codeMode: true }),
+    })
+    try {
+      registry.updateContextSnapshot("ses_idle_1", {
+        agent: "build",
+        tools: {
+          subagent: { description: "Run subagent", input: { type: "object", properties: {} } },
+        },
+      })
+      const lm = createAgyLanguageModel("gemini-4-neon", registry)
+      const { stream: s1 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_idle_1" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:PURE_OK] first" }] }],
+      })
+      await readStreamParts(s1)
+
+      const acpSid = registry.getState("ses_idle_1").acpSessionId
+      expect(acpSid).toBeTruthy()
+      expect(registry.getState("ses_idle_1").connected).toBe(true)
+      expect(store.get("antigravity-acp:session:ses_idle_1")).toBe(acpSid)
+
+      // Arm idle reaper and wait past idleTimeoutMs
+      registry.armIdle("ses_idle_1")
+      await Bun.sleep(140)
+      expect(registry.getState("ses_idle_1").connected).toBe(false)
+      expect(store.get("antigravity-acp:session:ses_idle_1")).toBe(acpSid)
+
+      // Next turn respawns proc and calls session/resume with preserved id
+      const { stream: s2 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_idle_1" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:PURE_OK] resumed" }] }],
+      })
+      const parts2 = await readStreamParts(s2)
+      expect(textFromParts(parts2)).toContain("resumed")
+      expect(registry.getState("ses_idle_1").acpSessionId).toBe(acpSid)
+
+      const events = fs
+        .readFileSync(eventsLog, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as { method: string; sessionId?: string })
+      expect(events.some((e) => e.method === "session/resume" && e.sessionId === acpSid)).toBe(true)
+
+      // armIdle must NOT evict while parked on an OpenCode tool call
+      const { stream: s3 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_idle_1" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:MCP_PAUSE_WATCHDOG]" }] }],
+      })
+      const parts3 = await readStreamParts(s3)
+      const toolCall = parts3.find((p) => p.type === "tool-call")
+      expect(toolCall?.type).toBe("tool-call")
+      registry.armIdle("ses_idle_1")
+      await Bun.sleep(140)
+      expect(registry.getState("ses_idle_1").connected).toBe(true)
+      expect(registry.getState("ses_idle_1").busy).toBe(true)
+
+      if (toolCall?.type === "tool-call") {
+        const { stream: s4 } = await lm.doStream({
+          headers: { "x-opencode-session-id": "ses_idle_1" },
+          prompt: [
+            { role: "user", content: [{ type: "text", text: "[SCENARIO:MCP_PAUSE_WATCHDOG]" }] },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: toolCall.toolCallId,
+                  toolName: toolCall.toolName,
+                  output: { type: "text", value: "ok" },
+                },
+              ],
+            },
+          ],
+        })
+        await readStreamParts(s4)
+      }
+
+      // deleteSession tears down proc and removes stored acpSessionId
+      await registry.deleteSession("ses_idle_1")
+      expect(registry.hasSession("ses_idle_1")).toBe(false)
+      expect(store.get("antigravity-acp:session:ses_idle_1")).toBeUndefined()
+    } finally {
+      if (prevSessions === undefined) delete process.env.FAKE_AGY_SESSIONS_FILE
+      else process.env.FAKE_AGY_SESSIONS_FILE = prevSessions
+      if (prevEvents === undefined) delete process.env.FAKE_AGY_EVENTS_LOG
+      else process.env.FAKE_AGY_EVENTS_LOG = prevEvents
+      await registry.disposeAll()
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
 })

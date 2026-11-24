@@ -18,7 +18,7 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
 ```json
 {
   "plugins": ["/path/to/opencode-agy-acp"],
-  "provider": {
+  "providers": {
     "antigravity-acp": {
       "settings": {
         "codeMode": false,

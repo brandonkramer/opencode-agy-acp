@@ -30,8 +30,23 @@ const pendingClientCalls = new Map<
 >()
 const sessionMcp = new Map<string, { url: string; headers: Record<string, string> }>()
 const sessionModel = new Map<string, string>()
-const knownSessions = new Set<string>()
-let sessionCounter = 0
+const sessionsFile = process.env.FAKE_AGY_SESSIONS_FILE
+function loadKnownSessions(): Set<string> {
+  if (!sessionsFile || !fs.existsSync(sessionsFile)) return new Set<string>()
+  try {
+    const parsed = JSON.parse(fs.readFileSync(sessionsFile, "utf8")) as unknown
+    return Array.isArray(parsed) ? new Set(parsed.map(String)) : new Set<string>()
+  } catch {
+    return new Set<string>()
+  }
+}
+function saveKnownSession(sid: string): void {
+  knownSessions.add(sid)
+  if (!sessionsFile) return
+  fs.writeFileSync(sessionsFile, JSON.stringify([...knownSessions]))
+}
+const knownSessions = loadKnownSessions()
+let sessionCounter = knownSessions.size
 
 function send(payload: Record<string, unknown>) {
   process.stdout.write(`${JSON.stringify(payload)}\n`)
@@ -343,7 +358,8 @@ rl.on("line", (line) => {
 
   if (method === "session/new") {
     const sid = `fake-sess-${++sessionCounter}`
-    knownSessions.add(sid)
+    saveKnownSession(sid)
+    logEvent({ method: "session/new", sessionId: sid })
     const mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : []
     const oc = mcpServers.find((s) => s && typeof s === "object" && (s as { name?: string }).name === "oc") as
       | { url?: string; headers?: Array<{ name: string; value: string }> }
@@ -387,6 +403,16 @@ rl.on("line", (line) => {
         error: { code: -32002, message: "Session not found" },
       })
       return
+    }
+    logEvent({ method: "session/resume", sessionId: sid })
+    const mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : []
+    const oc = mcpServers.find((s) => s && typeof s === "object" && (s as { name?: string }).name === "oc") as
+      | { url?: string; headers?: Array<{ name: string; value: string }> }
+      | undefined
+    if (oc?.url) {
+      const hdrs: Record<string, string> = {}
+      for (const h of oc.headers ?? []) hdrs[h.name] = h.value
+      sessionMcp.set(sid, { url: oc.url, headers: hdrs })
     }
     send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: sid } })
     return
