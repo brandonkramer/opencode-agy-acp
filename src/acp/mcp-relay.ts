@@ -1,6 +1,7 @@
 import crypto from "node:crypto"
 import http from "node:http"
 import { NATIVE_SHADOWED_TOOLS, PROVIDER_ID, isRecord } from "../types.js"
+import { rewriteCodeModeExecuteRefs } from "./instructions.js"
 
 export interface McpToolDescriptor {
   readonly name: string
@@ -60,7 +61,16 @@ function enrichMcpToolDescription(toolName: string, rawDescription: string): str
     return `${base}\n\nOpenCode agents include "explore" (read-only search/review), "general", "build", and "plan". Optional \`model\` uses "<provider>/<modelID>".`
   }
   if (toolName === "execute") {
-    return `${base}\n\nOpenCode Code Mode JavaScript runtime (callable in Antigravity ACP as \`mcp_oc_execute\`): call \`await tools.<namespace>.<tool>(...)\` or \`await search({ query })\` to inspect hidden MCP and workspace tool namespaces.`
+    const normalizedBase = rewriteCodeModeExecuteRefs(base)
+    return [
+      "PREFER THIS TOOL over `run_command` or sequential tool calls whenever calling OpenCode MCP tools, `tools.opencode.*`, batching multiple calls (`Promise.all`), or filtering/transforming large outputs in JavaScript before returning a concise result.",
+      "",
+      normalizedBase,
+      "",
+      "Callable in Antigravity ACP as `mcp_oc_execute`. Example:",
+      'const matches = await search({ query: "..." });',
+      "return matches.items.map((t) => t.path);",
+    ].join("\n")
   }
   return base
 }

@@ -12,6 +12,9 @@ const CODE_MODE_ONLY_KEYS = new Set(["core/codemode", "core/mcp-guidance"])
 
 const UNKEYED_CODE_MODE_RE = /^#\s+Code Mode\b/i
 
+const CODE_MODE_EXECUTE_REF_RE =
+  /\b(inside(?:\s+the)?|using|use|call(?:ing)?|via|the)(\s+)`execute`/gi
+
 export type SystemPromptInputItem =
   | string
   | {
@@ -27,6 +30,11 @@ export function stripInternalOpencodeNamespace(text: string): string {
     .replace(/<opencode:[^/>]+\/>/gi, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim()
+}
+
+/** Rewrite OpenCode's `execute` tool references to `mcp_oc_execute` for Antigravity ACP. */
+export function rewriteCodeModeExecuteRefs(text: string): string {
+  return text.replace(CODE_MODE_EXECUTE_REF_RE, "$1$2`mcp_oc_execute`")
 }
 
 function extractInstructionChunks(
@@ -73,14 +81,17 @@ export function extractOpenCodeInstructions(params: {
   readonly relayedToolNames?: readonly string[]
 }): string | undefined {
   const codeModeEnabled = params.codeModeEnabled ?? false
+  const hasExecuteRelay = codeModeEnabled && Boolean(params.relayedToolNames?.includes("execute"))
   const sections: string[] = []
   const seen = new Set<string>()
 
   if (codeModeEnabled && params.relayedToolNames && params.relayedToolNames.length > 0) {
     const lines = ["# OpenCode Relayed Tools (MCP `oc`)"]
-    if (params.relayedToolNames.includes("execute")) {
+    if (hasExecuteRelay) {
       lines.push(
-        "- OpenCode's Code Mode `execute` tool is callable here as `mcp_oc_execute` (always invoke `mcp_oc_execute`, not bare `execute`).",
+        "- **Code Mode (`mcp_oc_execute`):** OpenCode's Code Mode JavaScript runtime is callable as `mcp_oc_execute` (never bare `execute`).",
+        "- **When to prefer `mcp_oc_execute`:** Use `mcp_oc_execute` FIRST instead of `run_command` or sequential calls whenever you need OpenCode MCP servers, `tools.opencode.*` (sessions, worktrees, automations, models, MCP resources), batching multiple tool calls with `Promise.all`, or filtering/aggregating large tool outputs in JavaScript before returning a concise result.",
+        '- Inside `mcp_oc_execute`, discover tools with `await search({ query: "..." })` and call them via their returned `path` (e.g. `await tools.<namespace>.<tool>({ ... })`). Keep single local file reads/edits/shell on native tools unless scripting a batch.',
       )
     }
     lines.push(
@@ -109,6 +120,8 @@ export function extractOpenCodeInstructions(params: {
       if (!codeModeEnabled) {
         if (UNKEYED_CODE_MODE_RE.test(cleaned)) continue
         cleaned = stripUnsafeInternalLines(cleaned)
+      } else if (hasExecuteRelay) {
+        cleaned = rewriteCodeModeExecuteRefs(cleaned)
       }
       if (!cleaned || seen.has(cleaned)) continue
       seen.add(cleaned)

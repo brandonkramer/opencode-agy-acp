@@ -3,8 +3,10 @@ import {
   buildSystemPromptAppend,
   extractOpenCodeInstructions,
   hashSystemPrompt,
+  rewriteCodeModeExecuteRefs,
   stripInternalOpencodeNamespace,
 } from "../src/acp/instructions.js"
+import { buildToolDescriptors } from "../src/acp/mcp-relay.js"
 
 describe("instructions forwarding helpers", () => {
   test("drops system[0], core/date, core/environment, Code Mode, and tools.opencode.* in Pure ACP", () => {
@@ -161,5 +163,64 @@ describe("instructions forwarding helpers", () => {
     expect(hashSystemPrompt(appended)).toBe(hashSystemPrompt("Follow AGENTS.md"))
     expect(hashSystemPrompt(appended)).not.toBe(hashSystemPrompt("Different"))
     expect(hashSystemPrompt(undefined)).toBe("none")
+  })
+
+  test("rewrites Code Mode `execute` references to `mcp_oc_execute` without touching prose or `db.execute`", () => {
+    const input = [
+      "Only work inside the `execute` tool (call only inside `execute`).",
+      "Consider using `execute` to call `tools.opencode.session.move`.",
+      "Called inside\n`execute` as `tools.opencode.*`.",
+      "You can execute the script or run `db.execute` directly.",
+    ].join("\n")
+
+    const rewritten = rewriteCodeModeExecuteRefs(input)
+    expect(rewritten).toContain("inside the `mcp_oc_execute` tool")
+    expect(rewritten).toContain("(call only inside `mcp_oc_execute`)")
+    expect(rewritten).toContain("using `mcp_oc_execute` to call")
+    expect(rewritten).toContain("Called inside\n`mcp_oc_execute` as `tools.opencode.*`")
+    expect(rewritten).toContain("execute the script")
+    expect(rewritten).toContain("`db.execute`")
+
+    const forwarded = extractOpenCodeInstructions({
+      agentName: "build",
+      codeModeEnabled: true,
+      relayedToolNames: ["execute", "subagent"],
+      system: [
+        { type: "text", text: "Base prompt" },
+        {
+          type: "text",
+          text: "",
+          metadata: {
+            experimental: {
+              instructions: [
+                {
+                  key: "core/codemode",
+                  text: "# Code Mode\nTools only work inside the `execute` tool.\n## Code Mode tools (call only inside `execute`)",
+                },
+              ],
+            },
+          },
+        },
+      ],
+    })
+    expect(forwarded).toContain("When to prefer `mcp_oc_execute`:")
+    expect(forwarded).toContain("inside the `mcp_oc_execute` tool")
+    expect(forwarded).toContain("call only inside `mcp_oc_execute`")
+    expect(forwarded).not.toContain("inside the `execute` tool")
+  })
+
+  test("buildToolDescriptors gives `execute` a trigger-first, `mcp_oc_execute`-normalized description", () => {
+    const { mcpDescriptors } = buildToolDescriptors({
+      execute: {
+        description: "Run JS. Inside `execute`, the only callable tools are Code Mode tools.",
+        input: { type: "object", properties: { code: { type: "string" } } },
+      },
+    })
+    expect(mcpDescriptors).toHaveLength(1)
+    const desc = mcpDescriptors[0]!.description
+    expect(desc.startsWith("PREFER THIS TOOL")).toBe(true)
+    expect(desc).toContain("Inside `mcp_oc_execute`")
+    expect(desc).not.toContain("Inside `execute`")
+    expect(desc).toContain('await search({ query: "..." })')
   })
 })
