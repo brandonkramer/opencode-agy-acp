@@ -1,10 +1,16 @@
 import { createHash } from "node:crypto"
 import { isRecord } from "../types.js"
+import { stripUnsafeInternalLines } from "./history.js"
 
 const MAX_SYSTEM_PROMPT_APPEND_CHARS = 120_000
 
 // Antigravity supplies its own date and workspace environment; avoid duplicating OpenCode's copies.
 const SUPPLIED_BY_AGY = new Set(["core/date", "core/environment"])
+
+// Code Mode / OpenCode MCP guidance is only relevant when Code Mode MCP relay is enabled.
+const CODE_MODE_ONLY_KEYS = new Set(["core/codemode", "core/mcp-guidance"])
+
+const UNKEYED_CODE_MODE_RE = /^#\s+Code Mode\b/i
 
 export type SystemPromptInputItem =
   | string
@@ -23,7 +29,10 @@ export function stripInternalOpencodeNamespace(text: string): string {
     .trim()
 }
 
-function extractInstructionChunks(item: SystemPromptInputItem): {
+function extractInstructionChunks(
+  item: SystemPromptInputItem,
+  codeModeEnabled: boolean,
+): {
   readonly hasInstructionsMeta: boolean
   readonly chunks: readonly string[]
 } {
@@ -39,6 +48,7 @@ function extractInstructionChunks(item: SystemPromptInputItem): {
       if (!isRecord(entry) || typeof entry.text !== "string") continue
       const key = typeof entry.key === "string" ? entry.key : undefined
       if (key && SUPPLIED_BY_AGY.has(key)) continue
+      if (!codeModeEnabled && key && CODE_MODE_ONLY_KEYS.has(key)) continue
       const text = entry.text.trim()
       if (text) out.push(text)
     }
@@ -52,13 +62,16 @@ function extractInstructionChunks(item: SystemPromptInputItem): {
 
 /**
  * Extract user/agent/skill/Code Mode instructions from OpenCode's session context,
- * dropping OpenCode's base provider prompt (`system[0]`) and built-in date/env sources.
+ * dropping OpenCode's base provider prompt (`system[0]`), built-in date/env sources,
+ * and (in Pure ACP) Code Mode / `tools.opencode.*` instructions.
  */
 export function extractOpenCodeInstructions(params: {
   readonly system: readonly SystemPromptInputItem[]
   readonly agentName?: string
   readonly agentSystem?: string
+  readonly codeModeEnabled?: boolean
 }): string | undefined {
+  const codeModeEnabled = params.codeModeEnabled ?? false
   const sections: string[] = []
   const seen = new Set<string>()
 
@@ -72,11 +85,15 @@ export function extractOpenCodeInstructions(params: {
 
   for (let idx = 0; idx < params.system.length; idx++) {
     const item = params.system[idx]!
-    const { hasInstructionsMeta, chunks } = extractInstructionChunks(item)
+    const { hasInstructionsMeta, chunks } = extractInstructionChunks(item, codeModeEnabled)
     // OpenCode's system[0] (when not an instructions container) is its base provider prompt.
     if (!hasInstructionsMeta && idx === 0) continue
     for (const raw of chunks) {
-      const cleaned = stripInternalOpencodeNamespace(raw)
+      let cleaned = stripInternalOpencodeNamespace(raw)
+      if (!codeModeEnabled) {
+        if (UNKEYED_CODE_MODE_RE.test(cleaned)) continue
+        cleaned = stripUnsafeInternalLines(cleaned)
+      }
       if (!cleaned || seen.has(cleaned)) continue
       seen.add(cleaned)
       sections.push(cleaned)

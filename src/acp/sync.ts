@@ -5,6 +5,7 @@ import { appendCurrentUserBlocks, formatToolResultOutput, isLocalStatusMessage }
 
 const DEFAULT_CHECKPOINT_MAX_CHARS = 24_000
 const CHECKPOINT_TRUNCATION_MARKER = "\n... [earlier turns truncated]"
+const SYSTEM_UPDATE_BLOCK_RE = /<system-update>[\s\S]*?<\/system-update>/gi
 
 export interface PersistedTurn {
   readonly userHash: string
@@ -22,7 +23,7 @@ export interface PersistedSessionRecord {
 }
 
 export interface PromptGroup {
-  readonly userMessage: LanguageModelV3Prompt[number]
+  readonly userMessages: readonly LanguageModelV3Prompt[number][]
   readonly trailingMessages: readonly LanguageModelV3Prompt[number][]
   readonly userHash: string
   readonly assistantHash: string
@@ -66,6 +67,10 @@ function hashBinaryData(data: Uint8Array | string | URL): string {
   return sha256Short(`str:${data.length}:${data.slice(0, 128)}:${data.slice(-64)}`).slice(0, 16)
 }
 
+function stripEphemeralSystemUpdates(text: string): string {
+  return text.replace(SYSTEM_UPDATE_BLOCK_RE, "").trim()
+}
+
 function isAcpHostedPart(part: unknown): boolean {
   if (!isRecord(part)) return false
   if (part.providerExecuted === true) return true
@@ -88,35 +93,58 @@ export function hashAssistantTextBlocks(chunks: readonly string[]): string {
   return sha256Short(`assistant:${normalized}`)
 }
 
+export function hashUserMessages(messages: readonly LanguageModelV3Prompt[number][]): {
+  readonly hash: string
+  readonly preview: string
+  readonly transcript: string
+} {
+  const strippedCanonical: unknown[] = []
+  const rawCanonical: unknown[] = []
+  const transcriptLines: string[] = []
+  const strippedLines: string[] = []
+
+  for (const msg of messages) {
+    if (msg.role !== "user" || !Array.isArray(msg.content)) continue
+    for (const part of msg.content) {
+      if (part.type === "text") {
+        const rawTrimmed = part.text.trim()
+        if (!rawTrimmed) continue
+        rawCanonical.push({ type: "text", text: rawTrimmed })
+        transcriptLines.push(rawTrimmed)
+        const stripped = stripEphemeralSystemUpdates(rawTrimmed)
+        if (stripped) {
+          strippedCanonical.push({ type: "text", text: stripped })
+          strippedLines.push(stripped)
+        }
+      } else if (part.type === "file") {
+        const entry = {
+          type: "file",
+          mediaType: part.mediaType,
+          filename: part.filename ?? "",
+          sig: hashBinaryData(part.data),
+        }
+        rawCanonical.push(entry)
+        strippedCanonical.push(entry)
+        const line = `[Attached file: ${part.filename ?? "file"} (${part.mediaType})]`
+        transcriptLines.push(line)
+        strippedLines.push(line)
+      }
+    }
+  }
+
+  const transcript = transcriptLines.join("\n").trim()
+  const chosenCanonical = strippedCanonical.length > 0 ? strippedCanonical : rawCanonical
+  const previewSource = strippedLines.length > 0 ? strippedLines.join("\n").trim() : transcript
+  const hash = chosenCanonical.length === 0 ? "empty" : sha256Short(JSON.stringify(chosenCanonical))
+  return { hash, preview: previewText(previewSource), transcript }
+}
+
 export function hashUserMessage(msg: LanguageModelV3Prompt[number]): {
   readonly hash: string
   readonly preview: string
   readonly transcript: string
 } {
-  if (msg.role !== "user" || !Array.isArray(msg.content)) {
-    return { hash: "empty", preview: "", transcript: "" }
-  }
-  const canonical: unknown[] = []
-  const textLines: string[] = []
-  for (const part of msg.content) {
-    if (part.type === "text") {
-      const trimmed = part.text.trim()
-      if (!trimmed) continue
-      canonical.push({ type: "text", text: trimmed })
-      textLines.push(trimmed)
-    } else if (part.type === "file") {
-      canonical.push({
-        type: "file",
-        mediaType: part.mediaType,
-        filename: part.filename ?? "",
-        sig: hashBinaryData(part.data),
-      })
-      textLines.push(`[Attached file: ${part.filename ?? "file"} (${part.mediaType})]`)
-    }
-  }
-  const transcript = textLines.join("\n").trim()
-  const hash = canonical.length === 0 ? "empty" : sha256Short(JSON.stringify(canonical))
-  return { hash, preview: previewText(transcript), transcript }
+  return hashUserMessages([msg])
 }
 
 function extractTrailingAssistantInfo(
@@ -161,10 +189,10 @@ function extractTrailingAssistantInfo(
   return { hash, preview: previewText(transcript), transcript }
 }
 
-/** Group a prompt into (userMessage, trailing assistant/tool messages) turns with hashes. */
+/** Group a prompt into (consecutive userMessages, trailing assistant/tool messages) turns with hashes. */
 export function fingerprintGroups(prompt: LanguageModelV3Prompt): PromptGroup[] {
   const groups: Array<{
-    userMessage: LanguageModelV3Prompt[number]
+    userMessages: LanguageModelV3Prompt[number][]
     trailingMessages: LanguageModelV3Prompt[number][]
   }> = []
 
@@ -172,17 +200,22 @@ export function fingerprintGroups(prompt: LanguageModelV3Prompt): PromptGroup[] 
     if (msg.role === "system") continue
     if (isLocalStatusMessage(msg)) continue
     if (msg.role === "user") {
-      groups.push({ userMessage: msg, trailingMessages: [] })
+      const prev = groups[groups.length - 1]
+      if (prev && prev.trailingMessages.length === 0) {
+        prev.userMessages.push(msg)
+      } else {
+        groups.push({ userMessages: [msg], trailingMessages: [] })
+      }
     } else if (groups.length > 0) {
-      groups[groups.length - 1].trailingMessages.push(msg)
+      groups[groups.length - 1]!.trailingMessages.push(msg)
     }
   }
 
   return groups.map((group) => {
-    const userInfo = hashUserMessage(group.userMessage)
+    const userInfo = hashUserMessages(group.userMessages)
     const assistantInfo = extractTrailingAssistantInfo(group.trailingMessages)
     return {
-      userMessage: group.userMessage,
+      userMessages: group.userMessages,
       trailingMessages: group.trailingMessages,
       userHash: userInfo.hash,
       assistantHash: assistantInfo.hash,
@@ -290,7 +323,7 @@ export function decideSync(params: {
 
 export function buildSavedHistory(params: {
   readonly priorGroups: readonly PromptGroup[]
-  readonly currentUserMessage?: LanguageModelV3Prompt[number]
+  readonly currentUserMessages?: readonly LanguageModelV3Prompt[number][]
   readonly assistantTextBlocks: readonly string[]
 }): PersistedTurn[] {
   const turns: PersistedTurn[] = params.priorGroups.map((g) => ({
@@ -299,8 +332,8 @@ export function buildSavedHistory(params: {
     ...(g.userPreview ? { userPreview: g.userPreview } : {}),
     ...(g.assistantPreview ? { assistantPreview: g.assistantPreview } : {}),
   }))
-  if (params.currentUserMessage) {
-    const userInfo = hashUserMessage(params.currentUserMessage)
+  if (params.currentUserMessages && params.currentUserMessages.length > 0) {
+    const userInfo = hashUserMessages(params.currentUserMessages)
     const assistantNormalized = normalizeAssistantBlocks(params.assistantTextBlocks)
     turns.push({
       userHash: userInfo.hash,
@@ -314,14 +347,14 @@ export function buildSavedHistory(params: {
 
 export function buildCheckpointPromptBlocks(params: {
   readonly groups: readonly PromptGroup[]
-  readonly currentUserMessage?: LanguageModelV3Prompt[number]
+  readonly currentUserMessages?: readonly LanguageModelV3Prompt[number][]
   readonly mode: "catch-up" | "restore"
   readonly maxChars?: number
 }): AcpContentBlock[] {
   const maxChars = params.maxChars ?? DEFAULT_CHECKPOINT_MAX_CHARS
   const formattedTurns: string[] = []
   for (const group of params.groups) {
-    const uText = hashUserMessage(group.userMessage).transcript || "[User message]"
+    const uText = hashUserMessages(group.userMessages).transcript || "[User message]"
     const lines = [`User: ${uText}`]
     if (group.assistantTranscript) {
       lines.push(`Assistant: ${group.assistantTranscript}`)
@@ -363,7 +396,9 @@ export function buildCheckpointPromptBlocks(params: {
     })
   }
 
-  appendCurrentUserBlocks(params.currentUserMessage, blocks)
+  for (const userMsg of params.currentUserMessages ?? []) {
+    appendCurrentUserBlocks(userMsg, blocks)
+  }
   if (blocks.length === 0) {
     blocks.push({ type: "text", text: "Continue." })
   }
@@ -382,55 +417,19 @@ export function buildSideCallPromptBlocks(
     if (msg.role === "system") {
       const content = typeof msg.content === "string" ? msg.content.trim() : ""
       if (content) systemLines.push(content)
-      continue
-    }
-    if (isLocalStatusMessage(msg)) continue
-    if (msg.role === "user") {
-      // Keep non-final users in transcript; append final user blocks verbatim below for images/text.
-      continue
-    }
-    if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      const parts: string[] = []
-      for (const part of msg.content) {
-        if (part.type === "text" && part.text.trim()) {
-          parts.push(part.text.trim())
-        } else if (part.type === "tool-call") {
-          parts.push(`[Tool call: ${part.toolName}]`)
-        } else if (part.type === "tool-result") {
-          const formatted = formatToolResultOutput(part.output)
-          if (formatted.text.trim()) {
-            parts.push(`[Tool ${part.toolName} result]: ${formatted.text.trim()}`)
-          }
-        }
-      }
-      if (parts.length > 0) {
-        conversationLines.push(`Assistant: ${parts.join("\n")}`)
-      }
-    } else if (msg.role === "tool" && Array.isArray(msg.content)) {
-      for (const part of msg.content) {
-        if (part.type !== "tool-result") continue
-        const formatted = formatToolResultOutput(part.output)
-        if (formatted.text.trim()) {
-          conversationLines.push(`[Tool ${part.toolName} result]: ${formatted.text.trim()}`)
-        }
-      }
     }
   }
 
   const nonSystem = prompt.filter((m) => m.role !== "system" && !isLocalStatusMessage(m))
-  let lastUserIdx = -1
-  for (let i = nonSystem.length - 1; i >= 0; i--) {
-    if (nonSystem[i].role === "user") {
-      lastUserIdx = i
-      break
-    }
+  let trailUserStart = nonSystem.length
+  while (trailUserStart > 0 && nonSystem[trailUserStart - 1]!.role === "user") {
+    trailUserStart--
   }
+  const hasTrailingUsers = trailUserStart < nonSystem.length
 
-  // Re-walk nonSystem to preserve exact chronological order before lastUserIdx.
-  conversationLines.length = 0
   for (let i = 0; i < nonSystem.length; i++) {
-    const msg = nonSystem[i]
-    if (i === lastUserIdx) continue
+    if (hasTrailingUsers && i >= trailUserStart) continue
+    const msg = nonSystem[i]!
     if (msg.role === "user") {
       const text = hashUserMessage(msg).transcript
       if (text) conversationLines.push(`User: ${text}`)
@@ -471,7 +470,11 @@ export function buildSideCallPromptBlocks(
   if (introParts.length > 0) {
     blocks.push({ type: "text", text: introParts.join("\n\n") })
   }
-  appendCurrentUserBlocks(lastUserIdx >= 0 ? nonSystem[lastUserIdx] : undefined, blocks)
+  if (hasTrailingUsers) {
+    for (const userMsg of nonSystem.slice(trailUserStart)) {
+      appendCurrentUserBlocks(userMsg, blocks)
+    }
+  }
   if (blocks.length === 0) {
     blocks.push({ type: "text", text: "Continue." })
   }

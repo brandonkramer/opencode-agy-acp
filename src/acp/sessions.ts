@@ -69,6 +69,7 @@ const COOLDOWN_BUCKETS: readonly CooldownBucket[] = ["global", "claude-gpt", "ge
 
 export interface SessionContextSnapshot {
   readonly agent: string
+  readonly codeModeEnabled: boolean
   readonly toolSignature: string
   readonly tools: Record<string, { readonly description: string; readonly input: unknown }>
   readonly mcpSafeToOriginal: Map<string, string>
@@ -367,6 +368,7 @@ export class SessionRegistry {
     if (
       prev &&
       prev.agent === input.agent &&
+      prev.codeModeEnabled === entry.codeModeEnabled &&
       prev.toolSignature === toolSignature &&
       prev.systemPromptHash === systemPromptHash
     ) {
@@ -378,6 +380,7 @@ export class SessionRegistry {
 
     entry.contextSnapshot = {
       agent: input.agent,
+      codeModeEnabled: entry.codeModeEnabled,
       toolSignature,
       tools: input.tools,
       mcpDescriptors,
@@ -1076,7 +1079,7 @@ export class SessionRegistry {
     const nonSystem = input.prompt.filter((m) => m.role !== "system" && !isLocalStatusMessage(m))
     const lastIsUser = nonSystem.at(-1)?.role === "user"
     const priorGroups = lastIsUser ? groups.slice(0, -1) : groups
-    const currentUserMsg = lastIsUser ? groups.at(-1)?.userMessage : undefined
+    const currentUserMessages = lastIsUser ? groups.at(-1)?.userMessages : undefined
 
     let prepared: {
       readonly proc: AcpProcess
@@ -1203,13 +1206,13 @@ export class SessionRegistry {
       syncDecision.kind === "catch-up"
         ? buildCheckpointPromptBlocks({
             groups: syncDecision.unseenGroups,
-            currentUserMessage: currentUserMsg,
+            currentUserMessages,
             mode: "catch-up",
           })
         : syncDecision.kind === "fresh-with-history"
           ? buildCheckpointPromptBlocks({
               groups: syncDecision.priorGroups,
-              currentUserMessage: currentUserMsg,
+              currentUserMessages,
               mode: "restore",
             })
           : buildThinAcpPromptBlocks(input.prompt)
@@ -1220,7 +1223,7 @@ export class SessionRegistry {
       recordPersisted = true
       const turns = buildSavedHistory({
         priorGroups,
-        currentUserMessage: currentUserMsg,
+        currentUserMessages,
         assistantTextBlocks: turn.assistantTextBlocks,
       })
       void this.runStorageSetRecord(entry, {

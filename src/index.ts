@@ -138,12 +138,27 @@ export default Plugin.define({
         { providerID },
       )
 
+      const syncProviderSettings = () =>
+        Effect.gen(function* () {
+          const info = yield* ctx.provider.get({ providerID }).pipe(Effect.option)
+          if (info._tag === "Some") {
+            registry.updateBaseSettings(
+              resolveSettings(
+                info.value.data as unknown as Record<string, unknown>,
+                process.env,
+                registry.settings,
+              ),
+            )
+          }
+        })
+
       yield* ctx.session.hook("context", (input) =>
         Effect.gen(function* () {
           if (input.model.providerID !== providerID) {
             sanitizeForNonAcpModel(input.messages)
             return
           }
+          yield* syncProviderSettings()
           sanitizeForAcpModel(input.messages)
           const agentOption = ctx.agent?.get
             ? yield* ctx.agent
@@ -152,10 +167,12 @@ export default Plugin.define({
             : Option.none()
           const agentSystem =
             agentOption._tag === "Some" ? agentOption.value.data.system : undefined
+          const state = registry.getState(input.sessionID)
           const rawInstructions = extractOpenCodeInstructions({
             system: input.system,
             agentName: input.agent,
             agentSystem,
+            codeModeEnabled: state.codeModeEnabled,
           })
           registry.updateContextSnapshot(input.sessionID, {
             agent: input.agent,
@@ -165,7 +182,6 @@ export default Plugin.define({
           // Thin ACP: clear outer system instructions so agy owns its core system prompt;
           // extracted instructions are forwarded via _meta.antigravity.systemPrompt.append.
           input.system = []
-          const state = registry.getState(input.sessionID)
           if (!state.codeModeEnabled) {
             // In Pure ACP keep OpenCode's native `question` tool if present so elicitation/create works.
             const questionTool = input.tools[OPENCODE_QUESTION_TOOL]
@@ -223,14 +239,18 @@ export default Plugin.define({
       )
 
       yield* ctx.rpc.register(AcpRpc, {
-        getState: (input) => {
-          const { sessionID } = input as { readonly sessionID: string }
-          return Effect.sync(() => registry.getState(sessionID))
-        },
-        getDiagnostics: (input) => {
-          const { sessionID } = input as { readonly sessionID: string }
-          return Effect.sync(() => registry.getDiagnostics(sessionID))
-        },
+        getState: (input) =>
+          Effect.gen(function* () {
+            const { sessionID } = input as { readonly sessionID: string }
+            yield* syncProviderSettings()
+            return registry.getState(sessionID)
+          }),
+        getDiagnostics: (input) =>
+          Effect.gen(function* () {
+            const { sessionID } = input as { readonly sessionID: string }
+            yield* syncProviderSettings()
+            return registry.getDiagnostics(sessionID)
+          }),
         setMode: (input) => {
           const { sessionID, mode } = input as {
             readonly sessionID: string

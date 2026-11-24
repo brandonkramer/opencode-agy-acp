@@ -406,16 +406,28 @@ export function appendCurrentUserBlocks(
 }
 
 export function buildThinAcpPromptBlocks(prompt: LanguageModelV3Prompt): AcpContentBlock[] {
-  const nonSystem = prompt.filter((m) => m.role !== "system")
+  const nonSystem = prompt.filter((m) => m.role !== "system" && !isLocalStatusMessage(m))
   if (nonSystem.length === 0) {
     return [{ type: "text", text: "Continue." }]
   }
-  let lastUserIdx = nonSystem.length - 1
-  while (lastUserIdx >= 0 && nonSystem[lastUserIdx].role !== "user") {
-    lastUserIdx--
+  let startIdx = nonSystem.length
+  while (startIdx > 0 && nonSystem[startIdx - 1]!.role === "user") {
+    startIdx--
   }
+  const trailingUsers =
+    startIdx < nonSystem.length
+      ? nonSystem.slice(startIdx)
+      : (() => {
+          let lastUserIdx = nonSystem.length - 1
+          while (lastUserIdx >= 0 && nonSystem[lastUserIdx]!.role !== "user") {
+            lastUserIdx--
+          }
+          return lastUserIdx >= 0 ? [nonSystem[lastUserIdx]!] : []
+        })()
   const blocks: AcpContentBlock[] = []
-  appendCurrentUserBlocks(lastUserIdx >= 0 ? nonSystem[lastUserIdx] : undefined, blocks)
+  for (const userMsg of trailingUsers) {
+    appendCurrentUserBlocks(userMsg, blocks)
+  }
   if (blocks.length === 0) {
     blocks.push({ type: "text", text: "Continue." })
   }

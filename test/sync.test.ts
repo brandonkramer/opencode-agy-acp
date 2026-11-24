@@ -9,6 +9,7 @@ import {
   hashAssistantTextBlocks,
   parsePersistedRecord,
 } from "../src/acp/sync.js"
+import { buildThinAcpPromptBlocks } from "../src/acp/history.js"
 import { PROVIDER_ID } from "../src/types.js"
 
 describe("turn fingerprinting and delta sync", () => {
@@ -44,7 +45,7 @@ describe("turn fingerprinting and delta sync", () => {
     }
     const recordedTurns = buildSavedHistory({
       priorGroups: [],
-      currentUserMessage: turn1User,
+      currentUserMessages: [turn1User],
       assistantTextBlocks: ["Let me check.", "Done inspecting."],
     })
 
@@ -101,7 +102,7 @@ describe("turn fingerprinting and delta sync", () => {
 
     const recordedTurns = buildSavedHistory({
       priorGroups: [],
-      currentUserMessage: u1,
+      currentUserMessages: [u1],
       assistantTextBlocks: ["agy answer 1"],
     })
     const recorded = { version: 1 as const, acpSessionId: "acp_live", turns: recordedTurns }
@@ -126,7 +127,7 @@ describe("turn fingerprinting and delta sync", () => {
       expect(catchUp.matchedCount).toBe(1)
       const blocks = buildCheckpointPromptBlocks({
         groups: catchUp.unseenGroups,
-        currentUserMessage: catchUpGroups.at(-1)?.userMessage,
+        currentUserMessages: catchUpGroups.at(-1)?.userMessages,
         mode: "catch-up",
       })
       expect(blocks[0]).toMatchObject({ type: "text" })
@@ -172,5 +173,53 @@ describe("turn fingerprinting and delta sync", () => {
     expect((blocks[0] as { text: string }).text).toContain("<compaction-context>")
     expect((blocks[0] as { text: string }).text).toContain("First response")
     expect((blocks[1] as { text: string }).text).toBe("Produce a summary.")
+  })
+
+  test("merges consecutive user messages and ignores ephemeral <system-update> wrappers", () => {
+    const sysUpdate: LanguageModelV3Prompt[number] = {
+      role: "user",
+      content: [{ type: "text", text: "<system-update>\nYou are in Plan mode.\n</system-update>" }],
+    }
+    const realPrompt: LanguageModelV3Prompt[number] = {
+      role: "user",
+      content: [{ type: "text", text: "hello" }],
+    }
+
+    // 1. Consecutive user messages merge into a single group -> priorGroups empty -> "fresh"
+    const turn1Groups = fingerprintGroups([sysUpdate, realPrompt])
+    expect(turn1Groups).toHaveLength(1)
+    expect(
+      decideSync({
+        recorded: undefined,
+        priorGroups: turn1Groups.slice(0, -1),
+        hasLiveOrResumableAcpSession: false,
+      }),
+    ).toEqual({ kind: "fresh" })
+
+    // Thin prompt blocks forward both trailing user messages in order
+    const thinBlocks = buildThinAcpPromptBlocks([sysUpdate, realPrompt])
+    expect(thinBlocks).toEqual([
+      { type: "text", text: "<system-update>\nYou are in Plan mode.\n</system-update>" },
+      { type: "text", text: "hello" },
+    ])
+
+    // 2. Step 2 omits the ephemeral <system-update> from Turn 1 and appends a trailing <system-update>
+    const recordedTurns = buildSavedHistory({
+      priorGroups: [],
+      currentUserMessages: [sysUpdate, realPrompt],
+      assistantTextBlocks: ["hi"],
+    })
+    const step2Groups = fingerprintGroups([
+      realPrompt,
+      { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      sysUpdate,
+    ])
+    expect(
+      decideSync({
+        recorded: { version: 1, acpSessionId: "acp_plan_1", turns: recordedTurns },
+        priorGroups: step2Groups.slice(0, -1),
+        hasLiveOrResumableAcpSession: true,
+      }),
+    ).toEqual({ kind: "continue", matchedCount: 1 })
   })
 })
