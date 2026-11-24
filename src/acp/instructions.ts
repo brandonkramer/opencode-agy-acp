@@ -15,6 +15,8 @@ const UNKEYED_CODE_MODE_RE = /^#\s+Code Mode\b/i
 const CODE_MODE_EXECUTE_REF_RE =
   /\b(inside(?:\s+the)?|using|use|call(?:ing)?|via|the)(\s+)`execute`/gi
 
+const FULL_CODE_MODE_DESC_RE = /\bBun\.(?:file|write|Glob)\b/
+
 export type SystemPromptInputItem =
   | string
   | {
@@ -22,6 +24,11 @@ export type SystemPromptInputItem =
       readonly text: string
       readonly metadata?: Record<string, unknown>
     }
+
+/** Detect whether OpenCode's experimental `full_codemode` is active on its `execute` tool. */
+export function isFullCodeModeExecuteDescription(description?: string): boolean {
+  return typeof description === "string" && FULL_CODE_MODE_DESC_RE.test(description)
+}
 
 /** Strip internal OpenCode XML namespace tags before forwarding to agy. */
 export function stripInternalOpencodeNamespace(text: string): string {
@@ -78,6 +85,7 @@ export function extractOpenCodeInstructions(params: {
   readonly agentName?: string
   readonly agentSystem?: string
   readonly codeModeEnabled?: boolean
+  readonly fullCodeMode?: boolean
   readonly relayedToolNames?: readonly string[]
 }): string | undefined {
   const codeModeEnabled = params.codeModeEnabled ?? false
@@ -88,11 +96,19 @@ export function extractOpenCodeInstructions(params: {
   if (codeModeEnabled && params.relayedToolNames && params.relayedToolNames.length > 0) {
     const lines = ["# OpenCode Relayed Tools (MCP `oc`)"]
     if (hasExecuteRelay) {
-      lines.push(
-        "- **Code Mode (`mcp_oc_execute`):** OpenCode's Code Mode JavaScript runtime is callable as `mcp_oc_execute` (never bare `execute`).",
-        "- **When to prefer `mcp_oc_execute`:** Use `mcp_oc_execute` FIRST instead of `run_command` or sequential calls whenever you need OpenCode MCP servers, `tools.opencode.*` (sessions, worktrees, automations, models, MCP resources), batching multiple tool calls with `Promise.all`, or filtering/aggregating large tool outputs in JavaScript before returning a concise result.",
-        '- Inside `mcp_oc_execute`, discover tools with `await search({ query: "..." })` and call them via their returned `path` (e.g. `await tools.<namespace>.<tool>({ ... })`). Keep single local file reads/edits/shell on native tools unless scripting a batch.',
-      )
+      if (params.fullCodeMode) {
+        lines.push(
+          "- **Full Code Mode (`mcp_oc_execute`):** OpenCode Full Code Mode is ACTIVE. Always invoke `mcp_oc_execute` (never bare `execute`).",
+          "- **Default to `mcp_oc_execute` over native tools:** Prefer `mcp_oc_execute` FIRST instead of `read_file`, `write_file`, `edit_file`, `grep_search`, `find_by_name`, or `run_command` whenever creating, reading, searching, or editing files, running shell commands, calling OpenCode MCP servers, or calling `tools.opencode.*`.",
+          '- Inside `mcp_oc_execute`, combine file reads/writes/edits (`Bun.file`, `Bun.write`, `Bun.Glob`), `fetch`, `tools.shell`, and MCP/OpenCode tools (`await search({ query: "..." })` / `await tools.<ns>.<tool>(...)`) into a single JavaScript script with `Promise.all` and return only a concise summary.',
+        )
+      } else {
+        lines.push(
+          "- **Code Mode (`mcp_oc_execute`):** OpenCode's Code Mode JavaScript runtime is callable as `mcp_oc_execute` (never bare `execute`).",
+          "- **When to prefer `mcp_oc_execute`:** Use `mcp_oc_execute` FIRST instead of `run_command` or sequential calls whenever you need OpenCode MCP servers, `tools.opencode.*` (sessions, worktrees, automations, models, MCP resources), batching multiple tool calls with `Promise.all`, or filtering/aggregating large tool outputs in JavaScript before returning a concise result.",
+          '- Inside `mcp_oc_execute`, discover tools with `await search({ query: "..." })` and call them via their returned `path` (e.g. `await tools.<namespace>.<tool>({ ... })`). Keep single local file reads/edits/shell on native tools unless scripting a batch.',
+        )
+      }
     }
     lines.push(
       `- Relayed OpenCode tools exposed with the \`mcp_oc_\` prefix: ${params.relayedToolNames

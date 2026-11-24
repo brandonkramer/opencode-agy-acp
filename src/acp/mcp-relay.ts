@@ -1,7 +1,7 @@
 import crypto from "node:crypto"
 import http from "node:http"
 import { NATIVE_SHADOWED_TOOLS, PROVIDER_ID, isRecord } from "../types.js"
-import { rewriteCodeModeExecuteRefs } from "./instructions.js"
+import { isFullCodeModeExecuteDescription, rewriteCodeModeExecuteRefs } from "./instructions.js"
 
 export interface McpToolDescriptor {
   readonly name: string
@@ -62,6 +62,18 @@ function enrichMcpToolDescription(toolName: string, rawDescription: string): str
   }
   if (toolName === "execute") {
     const normalizedBase = rewriteCodeModeExecuteRefs(base)
+    if (isFullCodeModeExecuteDescription(base)) {
+      return [
+        "PRIMARY TOOL (OpenCode Full Code Mode): PREFER `mcp_oc_execute` over native `read_file`, `write_file`, `edit_file`, `grep_search`, `find_by_name`, and `run_command` for creating, reading, searching, or editing files (especially multiple files), running shell commands, OpenCode MCP tools, and `tools.opencode.*`. Batch work into ONE JavaScript script and return a concise summary.",
+        "",
+        normalizedBase,
+        "",
+        "Callable in Antigravity ACP as `mcp_oc_execute`. Example:",
+        'await Promise.all([Bun.write("a.txt", "hello\\n"), Bun.write("b.txt", "world\\n")]);',
+        'const text = await Bun.file("a.txt").text();',
+        "return { written: 2, preview: text.trim() };",
+      ].join("\n")
+    }
     return [
       "PREFER THIS TOOL over `run_command` or sequential tool calls whenever calling OpenCode MCP tools, `tools.opencode.*`, batching multiple calls (`Promise.all`), or filtering/transforming large outputs in JavaScript before returning a concise result.",
       "",

@@ -3,6 +3,7 @@ import {
   buildSystemPromptAppend,
   extractOpenCodeInstructions,
   hashSystemPrompt,
+  isFullCodeModeExecuteDescription,
   rewriteCodeModeExecuteRefs,
   stripInternalOpencodeNamespace,
 } from "../src/acp/instructions.js"
@@ -222,5 +223,35 @@ describe("instructions forwarding helpers", () => {
     expect(desc).toContain("Inside `mcp_oc_execute`")
     expect(desc).not.toContain("Inside `execute`")
     expect(desc).toContain('await search({ query: "..." })')
+  })
+
+  test("auto-detects full_codemode and steers Gemini to prefer mcp_oc_execute for file edits", () => {
+    const fullDesc =
+      "Run JavaScript in a confined Code Mode runtime. `fetch` is available, and Bun's file APIs (`Bun.file`, `Bun.write`, `Bun.Glob`) for files. Inside `execute`, only catalog tools are callable."
+    expect(isFullCodeModeExecuteDescription(fullDesc)).toBe(true)
+    expect(isFullCodeModeExecuteDescription("Run JavaScript in Code Mode.")).toBe(false)
+    expect(isFullCodeModeExecuteDescription(undefined)).toBe(false)
+
+    const forwarded = extractOpenCodeInstructions({
+      agentName: "build",
+      codeModeEnabled: true,
+      fullCodeMode: true,
+      relayedToolNames: ["execute"],
+      system: [{ type: "text", text: "Base prompt" }],
+    })
+    expect(forwarded).toContain("OpenCode Full Code Mode is ACTIVE")
+    expect(forwarded).toContain("Prefer `mcp_oc_execute` FIRST instead of `read_file`, `write_file`, `edit_file`")
+    expect(forwarded).not.toContain("Keep single local file reads/edits/shell on native tools")
+
+    const { mcpDescriptors } = buildToolDescriptors({
+      execute: {
+        description: fullDesc,
+        input: { type: "object", properties: { code: { type: "string" } } },
+      },
+    })
+    const desc = mcpDescriptors[0]!.description
+    expect(desc.startsWith("PRIMARY TOOL (OpenCode Full Code Mode)")).toBe(true)
+    expect(desc).toContain("Inside `mcp_oc_execute`")
+    expect(desc).toContain('Bun.write("a.txt"')
   })
 })

@@ -8,7 +8,10 @@ import {
   sanitizeForNonAcpModel,
   summarizeTitleFromMessages,
 } from "./acp/history.js"
-import { extractOpenCodeInstructions } from "./acp/instructions.js"
+import {
+  extractOpenCodeInstructions,
+  isFullCodeModeExecuteDescription,
+} from "./acp/instructions.js"
 import { SessionRegistry } from "./acp/sessions.js"
 import { createAgyLanguageModel } from "./language-model.js"
 import { AcpRpc } from "./rpc.js"
@@ -185,6 +188,7 @@ export default Plugin.define({
             agentName: input.agent,
             agentSystem,
             codeModeEnabled: resolvedTools.codeModeEnabled,
+            fullCodeMode: isFullCodeModeExecuteDescription(input.tools.execute?.description),
             relayedToolNames: resolvedTools.relayedToolNames,
           })
           registry.updateContextSnapshot(input.sessionID, {
