@@ -158,6 +158,16 @@ export default Plugin.define({
             sanitizeForNonAcpModel(input.messages)
             return
           }
+          if (registry.hasParkedTurn(input.sessionID)) {
+            // Fast path: parked MCP/question tool-result continuation reuses the active ACP turn
+            // directly — skip redundant provider/agent lookups, history scans, and prompt extraction.
+            input.system = []
+            if (!registry.isCodeModeEnabled(input.sessionID)) {
+              const questionTool = input.tools[OPENCODE_QUESTION_TOOL]
+              input.tools = questionTool ? { [OPENCODE_QUESTION_TOOL]: questionTool } : {}
+            }
+            return
+          }
           yield* syncProviderSettings()
           sanitizeForAcpModel(input.messages)
           const agentOption = ctx.agent?.get
@@ -179,6 +189,7 @@ export default Plugin.define({
             agent: input.agent,
             tools: input.tools,
             rawInstructions,
+            resolvedTools,
           })
           // Thin ACP: clear outer system instructions so agy owns its core system prompt;
           // extracted instructions are forwarded via _meta.antigravity.systemPrompt.append.

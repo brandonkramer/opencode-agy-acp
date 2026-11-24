@@ -31,9 +31,50 @@ const TERMINAL_TOOL_STATUSES = new Set([
 const ERROR_TOOL_STATUSES = new Set(["failed", "error", "cancelled", "canceled", "denied", "rejected"])
 
 const SMOOTH_MIN_CHUNK_CHARS = 32
-const SMOOTH_TARGET_TICKS = 12
-const SMOOTH_MIN_SLICE_CHARS = 16
+const SMOOTH_TEXT_TARGET_TICKS = 14
+const SMOOTH_TEXT_MIN_SLICE = 12
+const SMOOTH_TEXT_SOFT_MAX_SLICE = 28
+const SMOOTH_TEXT_SOFT_BACKLOG = 450
+const SMOOTH_REASONING_TARGET_TICKS = 24
+const SMOOTH_REASONING_MIN_SLICE = 14
+const SMOOTH_REASONING_SOFT_MAX_SLICE = 28
+const SMOOTH_REASONING_SOFT_BACKLOG = 800
 const DEFAULT_SMOOTH_INTERVAL_MS = 14
+const MAX_TOOL_RESULT_CHARS = 16_000
+const AGY_TOOL_HEADER_RE = /^Created At:[^\n]*\n(?:Completed At:[^\n]*\n)?/i
+const AGY_CMD_OK_WRAPPER_RE = /^Command exited with code 0\.\n+(?:Command output:\n)?/i
+
+function computeSmoothSliceChars(kind: "text" | "reasoning", pendingLen: number): number {
+  if (kind === "reasoning") {
+    const scaled = Math.ceil(pendingLen / SMOOTH_REASONING_TARGET_TICKS)
+    if (pendingLen <= SMOOTH_REASONING_SOFT_BACKLOG) {
+      return Math.max(SMOOTH_REASONING_MIN_SLICE, Math.min(SMOOTH_REASONING_SOFT_MAX_SLICE, scaled))
+    }
+    return Math.max(SMOOTH_REASONING_MIN_SLICE, scaled)
+  }
+  const scaled = Math.ceil(pendingLen / SMOOTH_TEXT_TARGET_TICKS)
+  if (pendingLen <= SMOOTH_TEXT_SOFT_BACKLOG) {
+    return Math.max(SMOOTH_TEXT_MIN_SLICE, Math.min(SMOOTH_TEXT_SOFT_MAX_SLICE, scaled))
+  }
+  return Math.max(SMOOTH_TEXT_MIN_SLICE, scaled)
+}
+
+function cleanToolOutputString(raw: string, exitCode?: number): string {
+  let cleaned = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+  cleaned = cleaned.replace(AGY_TOOL_HEADER_RE, "")
+  if (exitCode === undefined || exitCode === 0) {
+    const stripped = cleaned.replace(AGY_CMD_OK_WRAPPER_RE, "")
+    if (stripped !== cleaned) {
+      cleaned = stripped.trim().length > 0 ? stripped.replace(/\n+$/, "") : "(no output)"
+    }
+  } else if (!/exit(?:ed)?(?:\s+with)?\s+code/i.test(cleaned)) {
+    cleaned = `[exit ${exitCode}]\n${cleaned}`
+  }
+  if (cleaned.length > MAX_TOOL_RESULT_CHARS) {
+    return `${cleaned.slice(0, MAX_TOOL_RESULT_CHARS)}\n... [truncated ${cleaned.length - MAX_TOOL_RESULT_CHARS} chars]`
+  }
+  return cleaned
+}
 
 /** Split a bursty text chunk at a nearby word boundary without breaking UTF-16 surrogate pairs. */
 export function takeSmoothSlice(text: string, targetChars: number): readonly [string, string] {
@@ -131,9 +172,32 @@ export function buildUsage(
   }
 }
 
-function extractToolContentText(update: AcpSessionUpdate): NonNullable<JSONValue> {
-  if (update.rawOutput !== undefined && update.rawOutput !== null) {
-    return update.rawOutput as NonNullable<JSONValue>
+/** Extract and normalize a native ACP tool result into compact, TUI-friendly output. */
+export function formatNativeToolResult(update: AcpSessionUpdate): NonNullable<JSONValue> {
+  const rawOutput = update.rawOutput
+  if (rawOutput !== undefined && rawOutput !== null) {
+    if (typeof rawOutput === "string") {
+      return cleanToolOutputString(rawOutput)
+    }
+    if (isRecord(rawOutput)) {
+      if (typeof rawOutput.output === "string") {
+        const exitCode = typeof rawOutput.exit_code === "number" ? rawOutput.exit_code : undefined
+        return cleanToolOutputString(rawOutput.output, exitCode)
+      }
+      if (typeof rawOutput.content === "string") {
+        return cleanToolOutputString(rawOutput.content)
+      }
+      if (typeof rawOutput.text === "string") {
+        return cleanToolOutputString(rawOutput.text)
+      }
+      try {
+        const serialized = JSON.stringify(rawOutput)
+        if (serialized.length > MAX_TOOL_RESULT_CHARS) {
+          return `${serialized.slice(0, MAX_TOOL_RESULT_CHARS)}\n... [truncated ${serialized.length - MAX_TOOL_RESULT_CHARS} chars]`
+        }
+      } catch {}
+    }
+    return rawOutput as NonNullable<JSONValue>
   }
   if (Array.isArray(update.content)) {
     const texts: string[] = []
@@ -151,7 +215,7 @@ function extractToolContentText(update: AcpSessionUpdate): NonNullable<JSONValue
         texts.push(JSON.stringify(block))
       }
     }
-    if (texts.length > 0) return texts.join("\n")
+    if (texts.length > 0) return cleanToolOutputString(texts.join("\n"))
   }
   return {
     status: update.status ?? "completed",
@@ -200,7 +264,7 @@ export class ActiveTurn {
   private pacedKind?: "text" | "reasoning"
   private pacedBlockId?: string
   private pacedRemainder = ""
-  private pacedSliceChars = SMOOTH_MIN_SLICE_CHARS
+  private pacedSliceChars = SMOOTH_TEXT_MIN_SLICE
   private pacedTimer?: ReturnType<typeof setTimeout>
   private pausedForPending = false
   private contextUsed?: number
@@ -298,6 +362,22 @@ export class ActiveTurn {
   }
 
   private emitPacedDelta(kind: "text" | "reasoning", id: string, text: string): void {
+    // Continuous same-block append: queue onto active pacer without causing a mid-stream jump.
+    if (
+      this.callbacks.smoothStreaming &&
+      this.controller &&
+      this.pacedKind === kind &&
+      this.pacedBlockId === id &&
+      this.pacedRemainder.length > 0
+    ) {
+      this.pacedRemainder += text
+      this.pacedSliceChars = computeSmoothSliceChars(kind, this.pacedRemainder.length)
+      if (!this.pacedTimer) {
+        this.scheduleNextPacedTick()
+      }
+      return
+    }
+
     this.flushPacedImmediate()
     if (!this.callbacks.smoothStreaming || !this.controller || text.length <= SMOOTH_MIN_CHUNK_CHARS) {
       this.emitPart({
@@ -308,10 +388,7 @@ export class ActiveTurn {
       return
     }
 
-    const sliceChars = Math.max(
-      SMOOTH_MIN_SLICE_CHARS,
-      Math.ceil(text.length / SMOOTH_TARGET_TICKS),
-    )
+    const sliceChars = computeSmoothSliceChars(kind, text.length)
     const [head, tail] = takeSmoothSlice(text, sliceChars)
     this.emitPart({
       type: kind === "reasoning" ? "reasoning-delta" : "text-delta",
@@ -521,7 +598,7 @@ export class ActiveTurn {
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined
       this.tryFlush(false)
-    }, immediate ? 0 : 15)
+    }, immediate ? 0 : 5)
     this.flushTimer.unref?.()
   }
 
@@ -737,7 +814,7 @@ export class ActiveTurn {
       if (TERMINAL_TOOL_STATUSES.has(status)) {
         this.activeNativeTools.delete(callId)
         const isError = ERROR_TOOL_STATUSES.has(status)
-        const resultPayload = extractToolContentText(update)
+        const resultPayload = formatNativeToolResult(update)
         this.emitPart({
           type: "tool-result",
           toolCallId: callId,

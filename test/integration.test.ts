@@ -568,7 +568,12 @@ describe("SessionRegistry + fake-agy integration", () => {
   })
 
   test("11. Auto-syncs OpenCode plan agent to ACP plan mode and respects explicit RPC override", async () => {
-    const { ctx } = createMockContext()
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-plan-"))
+    const eventsLog = path.join(tmp, "events.log")
+    const prevEvents = process.env.FAKE_AGY_EVENTS_LOG
+    process.env.FAKE_AGY_EVENTS_LOG = eventsLog
+
+    const { ctx } = createMockContext({ cwd: tmp })
     const registry = new SessionRegistry(ctx, {
       settings: makeSettings({ codeMode: false }),
     })
@@ -586,6 +591,16 @@ describe("SessionRegistry + fake-agy integration", () => {
       const planMeta = JSON.parse(planText.replace("META:", "")) as { sessionId: string; mode: string | null }
       expect(planMeta.mode).toBe("plan")
       expect(registry.getState("ses_plan_1").mode).toBe("plan")
+
+      // Turn 1 in plan agent must set_mode("plan") directly once, never "auto" then "plan".
+      const turn1Events = fs
+        .readFileSync(eventsLog, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as { method: string; mode?: string })
+        .filter((e) => e.method === "session/set_mode")
+      expect(turn1Events).toHaveLength(1)
+      expect(turn1Events[0]?.mode).toBe("plan")
 
       // Switching back to build agent restores defaultMode ("auto") on the same ACP session.
       const u2 = { role: "user" as const, content: [{ type: "text" as const, text: "[SCENARIO:ECHO_META]" }] }
@@ -626,7 +641,10 @@ describe("SessionRegistry + fake-agy integration", () => {
       expect(overrideMeta.sessionId).toBe(planMeta.sessionId)
       expect(overrideMeta.mode).toBe("accept-edits")
     } finally {
+      if (prevEvents === undefined) delete process.env.FAKE_AGY_EVENTS_LOG
+      else process.env.FAKE_AGY_EVENTS_LOG = prevEvents
       await registry.disposeAll()
+      fs.rmSync(tmp, { recursive: true, force: true })
     }
   })
 

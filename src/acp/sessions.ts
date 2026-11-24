@@ -189,6 +189,15 @@ export class SessionRegistry {
     return this.entries.has(sessionID)
   }
 
+  hasParkedTurn(sessionID: string): boolean {
+    const turn = this.entries.get(sessionID)?.activeTurn
+    return Boolean(turn && turn.dispatchedCallIds.size > 0)
+  }
+
+  isCodeModeEnabled(sessionID: string): boolean {
+    return this.entries.get(sessionID)?.codeModeEnabled ?? (this.baseSettings.codeMode === true)
+  }
+
   private getOrCreateEntry(sessionID: string): Entry {
     let entry = this.entries.get(sessionID)
     if (!entry) {
@@ -601,13 +610,14 @@ export class SessionRegistry {
       readonly agent: string
       readonly tools: Record<string, { readonly description: string; readonly input: unknown }>
       readonly rawInstructions?: string
+      readonly resolvedTools?: ReturnType<SessionRegistry["resolveContextTools"]>
     },
   ): void {
     const entry = this.getOrCreateEntry(sessionID)
     if (!entry.modeExplicit) {
       entry.mode = input.agent === "plan" ? "plan" : this.baseSettings.defaultMode
     }
-    const resolved = this.resolveContextTools(sessionID, input.tools)
+    const resolved = input.resolvedTools ?? this.resolveContextTools(sessionID, input.tools)
     if (!entry.codeModeExplicit) {
       entry.codeModeEnabled = resolved.codeModeEnabled
     }
@@ -974,11 +984,6 @@ export class SessionRegistry {
         entry.lastModelId = undefined
         entry.lastModeApplied = undefined
         entry.lastSystemPromptHash = systemPromptHash
-        const desiredMode = this.effectiveModeFor(entry, runtimeSettings)
-        if (desiredMode !== "default") {
-          await entry.proc.setMode(entry.acpSessionId, desiredMode).catch(() => {})
-          entry.lastModeApplied = desiredMode
-        }
         void this.runStorageSetRecord(entry, {
           version: 1,
           acpSessionId: entry.acpSessionId,
@@ -1090,11 +1095,6 @@ export class SessionRegistry {
       }
     }
 
-    const desiredMode = this.effectiveModeFor(entry, runtimeSettings)
-    if (desiredMode !== "default") {
-      await proc.setMode(entry.acpSessionId, desiredMode).catch(() => {})
-      entry.lastModeApplied = desiredMode
-    }
     return { proc, acpSessionId: entry.acpSessionId, freshSession }
   }
 
@@ -1319,13 +1319,6 @@ export class SessionRegistry {
 
     const entry = this.getOrCreateEntry(input.sessionID)
     this.clearIdleTimer(entry)
-    const runtimeSettings = input.runtimeSettings ?? this.baseSettings
-    if (!entry.codeModeExplicit) {
-      entry.codeModeEnabled = entry.contextSnapshot
-        ? this.resolveContextTools(entry.sessionID, entry.contextSnapshot.tools, runtimeSettings)
-            .codeModeEnabled
-        : runtimeSettings.codeMode === true
-    }
 
     // Immediate continuation path when OpenCode finishes executing parked MCP / question calls.
     const existingTurn = entry.activeTurn
@@ -1335,6 +1328,19 @@ export class SessionRegistry {
         return existingTurn.createBoundStream(input.abortSignal, () => {
           existingTurn.resumeWithToolResults(matched)
         })
+      }
+    }
+
+    const runtimeSettings = input.runtimeSettings ?? this.baseSettings
+    if (!entry.codeModeExplicit) {
+      if (entry.contextSnapshot) {
+        entry.codeModeEnabled =
+          runtimeSettings === this.baseSettings
+            ? entry.contextSnapshot.codeModeEnabled
+            : this.resolveContextTools(entry.sessionID, entry.contextSnapshot.tools, runtimeSettings)
+                .codeModeEnabled
+      } else {
+        entry.codeModeEnabled = runtimeSettings.codeMode === true
       }
     }
 
@@ -1425,33 +1431,47 @@ export class SessionRegistry {
             }
 
             const target = resolveAcpModelTarget(this.catalog, input.modelID, input.variant)
-            if (entry.lastModelId !== target.acpModelId) {
-              try {
-                await ensured.proc.setModel(ensured.acpSessionId, target.acpModelId)
-              } catch {
-                await ensured.proc
-                  .setConfigOption(ensured.acpSessionId, "model", target.baseModelId)
-                  .catch(() => {})
-                if (target.thoughtLevel) {
-                  await ensured.proc
-                    .setConfigOption(ensured.acpSessionId, "thought_level", target.thoughtLevel)
-                    .catch(() => {})
-                }
-              }
-              entry.lastModelId = target.acpModelId
-            }
-
             const desiredMode = this.effectiveModeFor(entry, runtimeSettings, input.agent)
             if (input.agent) entry.lastAgent = input.agent
             if (!entry.modeExplicit) {
               entry.mode = desiredMode
             }
+
+            const setupOps: Promise<void>[] = []
+            if (entry.lastModelId !== target.acpModelId) {
+              setupOps.push(
+                (async () => {
+                  try {
+                    await ensured.proc.setModel(ensured.acpSessionId, target.acpModelId)
+                  } catch {
+                    await ensured.proc
+                      .setConfigOption(ensured.acpSessionId, "model", target.baseModelId)
+                      .catch(() => {})
+                    if (target.thoughtLevel) {
+                      await ensured.proc
+                        .setConfigOption(ensured.acpSessionId, "thought_level", target.thoughtLevel)
+                        .catch(() => {})
+                    }
+                  }
+                  entry.lastModelId = target.acpModelId
+                })(),
+              )
+            }
             if (
               entry.lastModeApplied !== desiredMode &&
               (desiredMode !== "default" || entry.lastModeApplied !== undefined)
             ) {
-              await ensured.proc.setMode(ensured.acpSessionId, desiredMode).catch(() => {})
-              entry.lastModeApplied = desiredMode
+              setupOps.push(
+                ensured.proc
+                  .setMode(ensured.acpSessionId, desiredMode)
+                  .catch(() => {})
+                  .then(() => {
+                    entry.lastModeApplied = desiredMode
+                  }),
+              )
+            }
+            if (setupOps.length > 0) {
+              await Promise.all(setupOps)
             }
 
             return {

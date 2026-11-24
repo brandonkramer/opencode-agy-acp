@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
-import { ActiveTurn, takeSmoothSlice } from "../src/acp/turn.js"
+import { ActiveTurn, formatNativeToolResult, takeSmoothSlice } from "../src/acp/turn.js"
 
 function makeTurn(overrides?: {
   readonly smoothStreaming?: boolean
@@ -137,5 +137,60 @@ describe("smooth streaming pacer (src/acp/turn.ts)", () => {
       .join("")
     expect(rText).toBe(thought)
     expect(aText).toBe(text)
+  })
+
+  test("appends back-to-back same-block chunks continuously without mid-stream jumps", async () => {
+    const turn = makeTurn({ smoothStreaming: true, smoothIntervalMs: 5 })
+    const chunk1 =
+      "First burst paragraph arriving from Gemini with plenty of words to stay queued when chunk two lands. "
+    const chunk2 =
+      "Second burst paragraph arrives ten milliseconds later and should flow seamlessly without dumping chunk one."
+
+    const parts = await drainTurn(turn, () => {
+      turn.handleUpdate({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: chunk1 },
+      })
+      setTimeout(() => {
+        turn.handleUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: chunk2 },
+        })
+      }, 10)
+      setTimeout(() => turn.finalizeStop(), 180)
+    })
+
+    const deltas = parts
+      .filter((p): p is Extract<LanguageModelV3StreamPart, { type: "text-delta" }> => p.type === "text-delta")
+      .map((p) => p.delta)
+    expect(deltas.join("")).toBe(chunk1 + chunk2)
+    expect(deltas.length).toBeGreaterThan(6)
+    // No single delta should dump the whole remainder of chunk1 (~80+ chars) in a jump
+    expect(Math.max(...deltas.map((d) => d.length))).toBeLessThan(45)
+  })
+
+  test("formatNativeToolResult strips agy command boilerplate, normalizes CRLF, preserves non-zero exit, and truncates huge outputs", () => {
+    const ok = formatNativeToolResult({
+      sessionUpdate: "tool_call_update",
+      rawOutput: {
+        output:
+          "Created At: 2026-11-24T23:21:14+01:00\nCompleted At: 2026-11-24T23:21:15+01:00\nCommand exited with code 0.\n\nCommand output:\nhi\r\nbye\r\n",
+        exit_code: 0,
+      },
+    })
+    expect(ok).toBe("hi\nbye")
+
+    const err = formatNativeToolResult({
+      sessionUpdate: "tool_call_update",
+      rawOutput: { output: "Created At: x\nboom\r\n", exit_code: 2 },
+    })
+    expect(err).toBe("[exit 2]\nboom\n")
+
+    const huge = formatNativeToolResult({
+      sessionUpdate: "tool_call_update",
+      rawOutput: { output: "x".repeat(20_000), exit_code: 0 },
+    })
+    expect(typeof huge).toBe("string")
+    expect(String(huge)).toContain("... [truncated 4000 chars]")
   })
 })
