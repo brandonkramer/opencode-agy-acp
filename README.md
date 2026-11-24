@@ -2,7 +2,7 @@
 
 A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), modeled on OpenCode's built-in `claude-agent` architecture.
 
-## Design & Features
+## Features
 
 1. **Stream-idle watchdog (`chunkTimeoutMs`, default 120s):** Rejects wedged `session/prompt` calls with `AcpStallError` + the last 8 wire-trace entries, cancels and kills the hung process group, and resets the session cleanly instead of hanging forever. Automatically pauses while OpenCode runs relayed tools, `question`, or permission prompts.
 2. **Deadlock-free tool & elicitation handling:**
