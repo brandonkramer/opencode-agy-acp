@@ -10,6 +10,7 @@ import type {
   SessionTitle,
 } from "@opencode/plugin/effect/session"
 import { Effect, Option, Scope, Stream } from "effect"
+import { resolveModelProfile } from "../src/acp/catalog.js"
 import plugin from "../src/index.js"
 import { OPENCODE_QUESTION_TOOL, PACKAGE_ID, PROVIDER_ID } from "../src/types.js"
 
@@ -711,6 +712,125 @@ describe("Plugin.define hook wiring (src/index.ts)", () => {
       if (tMsg.role === "assistant") {
         expect(tMsg.content.every((p) => p.type === "text")).toBe(true)
       }
+    } finally {
+      await Effect.runPromise(Scope.close(scope, Option.none() as never))
+    }
+  })
+
+  test("populates per-family model limits and input modalities in provider transform", async () => {
+    expect(resolveModelProfile("gemini-4-neon")).toEqual({
+      limit: { context: 1_048_576, output: 65_536 },
+      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+    })
+    expect(resolveModelProfile("claude-opus-5-5")).toEqual({
+      limit: { context: 1_000_000, output: 128_000 },
+      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+    })
+    expect(resolveModelProfile("claude-sonnet-4-6")).toEqual({
+      limit: { context: 1_000_000, output: 64_000 },
+      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+    })
+    expect(resolveModelProfile("gpt-oss-120b-medium")).toEqual({
+      limit: { context: 131_072, output: 32_768 },
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+    })
+    expect(resolveModelProfile("unknown-future-model")).toEqual({
+      limit: { context: 200_000, output: 65_536 },
+      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+    })
+
+    const store = new Map<string, unknown>()
+    const providers = new Map<string, { info: Provider.Info; models: readonly Model.Info[] }>()
+    store.set("antigravity-acp:model-catalog:v1", {
+      version: 1,
+      updatedAt: Date.now(),
+      models: [
+        {
+          id: "gemini-4-neon",
+          name: "Gemini 4 Neon",
+          family: "gemini-4-neon",
+          defaultAcpModelId: "gemini-4-neon-high",
+          variants: [{ id: "high", acpModelId: "gemini-4-neon-high", thoughtLevel: "high" }],
+        },
+        {
+          id: "claude-opus-5-5",
+          name: "Claude Opus 5.5",
+          family: "claude-opus-5-5",
+          defaultAcpModelId: "claude-opus-5-5-medium",
+          variants: [{ id: "medium", acpModelId: "claude-opus-5-5-medium", thoughtLevel: "medium" }],
+        },
+        {
+          id: "gpt-oss-120b-medium",
+          name: "GPT-OSS 120B (Medium)",
+          family: "gpt-oss-120b-medium",
+          defaultAcpModelId: "gpt-oss-120b-medium",
+          variants: [],
+        },
+      ],
+    })
+
+    const mockCtx = {
+      location: { directory: process.cwd() },
+      storage: {
+        get: (key: string) => Effect.sync(() => store.get(key) as never),
+        set: (key: string, value: unknown) =>
+          Effect.sync(() => {
+            store.set(key, value)
+          }),
+        remove: (key: string) =>
+          Effect.sync(() => {
+            store.delete(key)
+          }),
+      },
+      provider: {
+        get: () => Effect.fail(new Error("not found") as never),
+        reload: () => Effect.void,
+        transform: (fn: (editor: ProviderEditor) => void) =>
+          Effect.sync(() => {
+            const editor: ProviderEditor = {
+              list: () => [],
+              get: (id) => {
+                const entry = providers.get(id)
+                if (!entry) return undefined
+                return {
+                  provider: entry.info,
+                  models: new Map(entry.models.map((m) => [m.id, m])),
+                }
+              },
+              add: (input) => {
+                providers.set(input.info.id, { info: input.info, models: input.models })
+              },
+              update: () => {},
+              remove: (id) => {
+                providers.delete(id)
+              },
+              models: { set: () => {}, update: () => {}, remove: () => {} },
+            }
+            fn(editor)
+          }),
+      },
+      aisdk: { hook: () => Effect.void },
+      session: {
+        get: () => Effect.succeed({ location: { directory: process.cwd() } } as never),
+        update: () => Effect.void,
+        hook: () => Effect.void,
+      },
+      permission: { assert: () => Effect.void },
+      rpc: {
+        register: () => Effect.sync(() => ({ events: { emit: () => Effect.void } }) as never),
+      },
+      event: { subscribe: () => Stream.empty },
+    } as unknown as Context
+
+    const scope = Effect.runSync(Scope.make())
+    try {
+      await Effect.runPromise(plugin.effect(mockCtx).pipe(Scope.provide(scope)))
+      const models = providers.get(PROVIDER_ID)?.models ?? []
+      const byId = new Map(models.map((m) => [String(m.id), m]))
+      expect(byId.get("gemini-4-neon")?.limit).toEqual({ context: 1_048_576, output: 65_536 })
+      expect(byId.get("claude-opus-5-5")?.limit).toEqual({ context: 1_000_000, output: 128_000 })
+      expect(byId.get("gpt-oss-120b-medium")?.limit).toEqual({ context: 131_072, output: 32_768 })
+      expect(byId.get("gpt-oss-120b-medium")?.capabilities.input).toEqual(["text"])
     } finally {
       await Effect.runPromise(Scope.close(scope, Option.none() as never))
     }

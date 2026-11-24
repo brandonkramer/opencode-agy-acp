@@ -62,10 +62,17 @@ export const FALLBACK_MODELS: readonly AcpDiscoveredModel[] = [
     variants: [],
   },
   {
-    id: "gemini-pro-orchestrator-g1-pro",
+    id: "gemini-pro-orchestrator",
+    name: "Orchestrator (Carbon)",
+    family: "gemini-pro-orchestrator",
+    defaultAcpModelId: "gemini-pro-orchestrator",
+    variants: [],
+  },
+  {
+    id: "gemini-pro-orchestrator-argon",
     name: "Orchestrator (Argon)",
-    family: "gemini-pro-orchestrator-g1-pro",
-    defaultAcpModelId: "gemini-pro-orchestrator-g1-pro",
+    family: "gemini-pro-orchestrator-argon",
+    defaultAcpModelId: "gemini-pro-orchestrator-argon",
     variants: [],
   },
   {
@@ -109,6 +116,52 @@ export const FALLBACK_MODELS: readonly AcpDiscoveredModel[] = [
     variants: [],
   },
 ]
+
+export interface AcpModelProfile {
+  readonly limit: {
+    readonly context: number
+    readonly output: number
+  }
+  readonly capabilities: {
+    readonly tools: boolean
+    readonly input: readonly string[]
+    readonly output: readonly string[]
+  }
+}
+
+/** Resolve per-family context/output limits and input modalities for discovered ACP models. */
+export function resolveModelProfile(modelId: string): AcpModelProfile {
+  const id = modelId.trim().toLowerCase()
+  if (id.startsWith("gpt-oss")) {
+    return {
+      limit: { context: 131_072, output: 32_768 },
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+    }
+  }
+  if (id.startsWith("claude-")) {
+    const output = /^claude-(?:opus|sonnet|fable)-5\b/.test(id) ? 128_000 : 64_000
+    return {
+      limit: { context: 1_000_000, output },
+      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+    }
+  }
+  if (id.startsWith("gemini-")) {
+    return {
+      limit: { context: 1_048_576, output: 65_536 },
+      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+    }
+  }
+  if (id.startsWith("gpt-")) {
+    return {
+      limit: { context: 400_000, output: 128_000 },
+      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+    }
+  }
+  return {
+    limit: { context: 200_000, output: 65_536 },
+    capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+  }
+}
 
 function cleanDisplayName(raw: string | undefined, fallback: string): string {
   return (raw ?? fallback).replace(/\s*\(ACP\)\s*$/i, "").trim() || fallback

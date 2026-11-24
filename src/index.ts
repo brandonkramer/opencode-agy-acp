@@ -2,6 +2,7 @@ import { Model, Plugin, Provider } from "@opencode/plugin/effect"
 import type { SessionContext } from "@opencode/plugin/effect/session"
 import type { Agent } from "@opencode/schema/agent"
 import { Effect, Option, Stream } from "effect"
+import { resolveModelProfile } from "./acp/catalog.js"
 import {
   sanitizeForAcpModel,
   sanitizeForNonAcpModel,
@@ -26,6 +27,7 @@ function buildModelEntries(
 ): Model.Info[] {
   return models.map((m) => {
     const defaults = Model.Info.default(providerID, Model.ID.make(m.id))
+    const profile = resolveModelProfile(m.id)
     return {
       ...defaults,
       family: Model.Family.make(m.family ?? m.id),
@@ -33,14 +35,14 @@ function buildModelEntries(
       // Inert generation marker ensures OpenCode refreshes LanguageModelV3 bindings on plugin reload.
       settings: { antigravityBridgeGeneration: bridgeGeneration },
       capabilities: {
-        tools: true,
-        input: ["text", "image"],
-        output: ["text"],
+        tools: profile.capabilities.tools,
+        input: [...profile.capabilities.input],
+        output: [...profile.capabilities.output],
       },
       variants: m.variants.map((v) => ({ id: Model.VariantID.make(v.id) })),
       limit: {
-        context: 1_048_576,
-        output: 65_536,
+        context: profile.limit.context,
+        output: profile.limit.output,
       },
     }
   })
