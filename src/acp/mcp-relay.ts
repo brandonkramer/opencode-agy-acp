@@ -12,7 +12,8 @@ const SPILL_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 let lastSpillPruneAt = 0
 
 const EXISTING_SAVED_FOOTER_RE =
-  /\n?(\[(?:showing lines [^\]]*?; full output saved to [^\]]+|compacted [^\]]*?; full log: [^\]]+|[^\]]*(?:full output saved to|output truncated[^\]]*saved to) [^\]]+)\])\s*$/i
+  /\n?(\[(?:showing lines [^\]\[\n]*?; full output saved to [^\]\[\n]+|compacted [^\]\[\n]*?; full log: [^\]\[\n]+|[^\]\[\n]*(?:full output saved to|output truncated[^\]\[\n]*saved to) [^\]\[\n]+)\])\s*$/i
+const MAX_EXISTING_FOOTER_CHARS = 512
 
 function safeSliceStart(text: string, len: number): string {
   if (len <= 0) return ""
@@ -75,8 +76,11 @@ export function compactMcpText(
   if (maxChars <= 0 || raw.length <= maxChars) return raw
 
   const footerMatch = EXISTING_SAVED_FOOTER_RE.exec(raw)
-  const existingFooter = footerMatch?.[1]
-  const body = footerMatch ? raw.slice(0, footerMatch.index) : raw
+  const existingFooter =
+    footerMatch?.[1] && footerMatch[1].length <= MAX_EXISTING_FOOTER_CHARS
+      ? footerMatch[1]
+      : undefined
+  const body = existingFooter && footerMatch ? raw.slice(0, footerMatch.index) : raw
 
   let footer: string
   if (existingFooter) {

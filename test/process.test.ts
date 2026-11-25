@@ -130,9 +130,10 @@ describe("AcpProcess & env", () => {
       env: () => ({ ...process.env, HOME: fakeHome, XDG_CACHE_HOME: fakeCache }),
     }
     const p1 = new AcpProcess({ cwd: tmp, binaryPath: FAKE_AGY, isolateUserMcp: true, io })
-    const p2 = new AcpProcess({ cwd: tmp, binaryPath: FAKE_AGY, isolateUserMcp: false, io })
+    let p2: AcpProcess | undefined
     try {
       await p1.initialize(5_000)
+      p2 = new AcpProcess({ cwd: tmp, binaryPath: FAKE_AGY, isolateUserMcp: false, io })
       await p2.initialize(5_000)
       const lines = fs
         .readFileSync(argsLog, "utf8")
@@ -145,7 +146,7 @@ describe("AcpProcess & env", () => {
     } finally {
       if (prevArgs === undefined) delete process.env.FAKE_AGY_ARGS_LOG
       else process.env.FAKE_AGY_ARGS_LOG = prevArgs
-      await Promise.allSettled([p1.dispose(), p2.dispose()])
+      await Promise.allSettled([p1.dispose(), ...(p2 ? [p2.dispose()] : [])])
       fs.rmSync(tmp, { recursive: true, force: true })
     }
   })

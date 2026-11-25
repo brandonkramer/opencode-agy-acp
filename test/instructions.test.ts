@@ -273,9 +273,9 @@ describe("instructions forwarding helpers", () => {
       const longStr = "A".repeat(12_000)
       expect(compactMcpText(longStr, { maxChars: 0, spillDir: tmp })).toBe(longStr)
 
-      // Preserves OpenCode's saved-file pointer when already truncated by OpenCode
+      // Preserves OpenCode's saved-file pointer when already truncated mid-JSON-array (unclosed `[`)
       const openCodeSaved =
-        `{"head":"start","blob":"${"X".repeat(12_000)}","tail":"end"}\n` +
+        `{"items":[{"id":0,"blob":"${"X".repeat(12_000)}"\n` +
         `[showing lines 1-1 of 1 (last line cut); full output saved to /home/user/.local/share/opencode/tool-output/tool_abc123]`
       const compactedExisting = compactMcpText(openCodeSaved, { maxChars: 2_000, spillDir: tmp })
       expect(compactedExisting.length).toBeLessThanOrEqual(2_000)
