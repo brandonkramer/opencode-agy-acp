@@ -100,13 +100,14 @@ export function extractOpenCodeInstructions(params: {
         lines.push(
           "- **Full Code Mode (`mcp_oc_execute`):** OpenCode Full Code Mode is ACTIVE. Always invoke `mcp_oc_execute` (never bare `execute`).",
           "- **Default to `mcp_oc_execute` over native tools:** Prefer `mcp_oc_execute` FIRST instead of `read_file`, `write_file`, `edit_file`, `grep_search`, `find_by_name`, or `run_command` whenever creating, reading, searching, or editing files, running shell commands, calling OpenCode MCP servers, or calling `tools.opencode.*`.",
-          '- Inside `mcp_oc_execute`, combine file reads/writes/edits (`Bun.file`, `Bun.write`, `Bun.Glob`), `fetch`, `tools.shell`, and MCP/OpenCode tools (`await search({ query: "..." })` / `await tools.<ns>.<tool>(...)`) into a single JavaScript script with `Promise.all` and return only a concise summary.',
+          '- **Batch & use Bun APIs:** Combine independent reads/writes/edits (`Bun.file`, `Bun.write`, `Bun.Glob` — prefer these over `tools.shell` for `ls`/`cat`/`head`/`tail`/`find`/`grep`), `fetch`, `tools.shell`, and MCP/OpenCode tools (`await search({ query: "..." })` / `await tools.<ns>.<tool>(...)`) into ONE script with `Promise.all` instead of sequential single-call turns.',
+          "- **Keep return payloads compact (< 4-6 KB):** Filter, slice, and summarize in JavaScript rather than returning raw files or large JSON blobs. Never `JSON.parse()` `.system_generated/steps/*/output.txt` or large `tools.shell` stdout (> 8 KB may be compacted; filter inside the command or redirect to a temp file and read with `Bun.file(...).json()`).",
         )
       } else {
         lines.push(
           "- **Code Mode (`mcp_oc_execute`):** OpenCode's Code Mode JavaScript runtime is callable as `mcp_oc_execute` (never bare `execute`).",
-          "- **When to prefer `mcp_oc_execute`:** Use `mcp_oc_execute` FIRST instead of `run_command` or sequential calls whenever you need OpenCode MCP servers, `tools.opencode.*` (sessions, worktrees, automations, models, MCP resources), batching multiple tool calls with `Promise.all`, or filtering/aggregating large tool outputs in JavaScript before returning a concise result.",
-          '- Inside `mcp_oc_execute`, discover tools with `await search({ query: "..." })` and call them via their returned `path` (e.g. `await tools.<namespace>.<tool>({ ... })`). Keep single local file reads/edits/shell on native tools unless scripting a batch.',
+          "- **When to prefer `mcp_oc_execute`:** Use `mcp_oc_execute` FIRST instead of `run_command` or sequential calls whenever you need OpenCode MCP servers, `tools.opencode.*` (sessions, worktrees, automations, models, MCP resources), batching multiple tool calls with `Promise.all`, or filtering/aggregating large tool outputs in JavaScript before returning a concise result (< 4-6 KB).",
+          '- Inside `mcp_oc_execute`, discover tools with `await search({ query: "..." })` and call them via their returned `path` (e.g. `await tools.<namespace>.<tool>({ ... })`). Keep single local file reads/edits/shell on native tools unless scripting a batch, and never `JSON.parse()` truncated `.system_generated/steps/*/output.txt` or large `tools.shell` stdout directly.',
         )
       }
     }

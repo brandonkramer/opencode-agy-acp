@@ -144,11 +144,76 @@ export interface AcpProcessHandlers {
   readonly onLog?: (level: "warn" | "debug", message: string, meta?: Record<string, unknown>) => void
 }
 
+const EMPTY_MCP_CONFIG = '{"mcpServers":{}}\n'
+
+/**
+ * Prepare an isolated `--gemini-dir` that suppresses `~/.gemini/config/mcp_config.json`
+ * while symlinking `antigravity-cli` to the user's real `~/.gemini/antigravity-cli`
+ * so OAuth tokens, settings, and `brain/` session resume remain intact.
+ * Returns `undefined` (failing open) if symlinks or cache directories cannot be created.
+ */
+export function ensureIsolatedGeminiDir(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
+  if (!home) return undefined
+
+  const realAppDataDir = path.join(home, ".gemini", "antigravity-cli")
+  const cacheRoot = env.XDG_CACHE_HOME?.trim() || path.join(home, ".cache")
+  const isolatedDir = path.join(cacheRoot, "opencode-agy-acp", "isolated-gemini")
+  const isolatedConfigDir = path.join(isolatedDir, "config")
+  const migratedPath = path.join(isolatedConfigDir, ".migrated")
+  const mcpConfigPath = path.join(isolatedConfigDir, "mcp_config.json")
+  const linkedAppData = path.join(isolatedDir, "antigravity-cli")
+
+  try {
+    fs.mkdirSync(realAppDataDir, { recursive: true })
+    fs.mkdirSync(isolatedConfigDir, { recursive: true })
+    if (!fs.existsSync(migratedPath)) {
+      fs.writeFileSync(migratedPath, "1\n", "utf8")
+    }
+    let writeMcp = true
+    try {
+      if (fs.readFileSync(mcpConfigPath, "utf8") === EMPTY_MCP_CONFIG) {
+        writeMcp = false
+      }
+    } catch {}
+    if (writeMcp) {
+      fs.writeFileSync(mcpConfigPath, EMPTY_MCP_CONFIG, "utf8")
+    }
+
+    let needLink = true
+    try {
+      const st = fs.lstatSync(linkedAppData)
+      if (st.isSymbolicLink()) {
+        const currentTarget = path.resolve(isolatedDir, fs.readlinkSync(linkedAppData))
+        if (currentTarget === path.resolve(realAppDataDir)) {
+          needLink = false
+        } else {
+          fs.unlinkSync(linkedAppData)
+        }
+      } else {
+        // Never overwrite a non-symlink directory/file placed by a user.
+        return undefined
+      }
+    } catch {}
+
+    if (needLink) {
+      fs.symlinkSync(realAppDataDir, linkedAppData, platform === "win32" ? "junction" : "dir")
+    }
+    return isolatedDir
+  } catch {
+    return undefined
+  }
+}
+
 export interface AcpProcessOptions extends AcpProcessHandlers {
   readonly cwd: string
   readonly binaryPath?: string
   readonly processPerSession?: boolean
   readonly includeDefaultCustomizations?: boolean
+  readonly isolateUserMcp?: boolean
   readonly dangerouslySkipPermissions?: boolean
   readonly extraDirs?: readonly string[]
   readonly traceLogPath?: string
@@ -204,6 +269,12 @@ export class AcpProcess {
     }
     if (options.includeDefaultCustomizations === false) {
       args.push("--include-default-customizations=false")
+    }
+    if (options.isolateUserMcp) {
+      const isolatedGeminiDir = ensureIsolatedGeminiDir(env)
+      if (isolatedGeminiDir) {
+        args.push("--gemini-dir", isolatedGeminiDir)
+      }
     }
     if (options.dangerouslySkipPermissions) {
       args.push("--dangerously-skip-permissions")

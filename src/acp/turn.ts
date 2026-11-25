@@ -140,20 +140,61 @@ export function buildUsage(
     activeContextUsed > 0
       ? activeContextUsed
       : undefined
-  const inputTotal = rawInput ?? derivedInputFromTotal ?? fallbackContext
-  const cacheRead =
-    rawCacheRead !== undefined && inputTotal !== undefined
-      ? Math.min(rawCacheRead, inputTotal)
-      : rawCacheRead
-  const cacheWrite =
-    rawCacheWrite !== undefined && inputTotal !== undefined
-      ? Math.min(rawCacheWrite, Math.max(0, inputTotal - (cacheRead ?? 0)))
-      : rawCacheWrite
+  const cachedSum = (rawCacheRead ?? 0) + (rawCacheWrite ?? 0)
+
+  let inputTotal: number | undefined
+  let cacheRead: number | undefined
+  let cacheWrite: number | undefined
+  let noCache: number | undefined
+
+  if (rawInput !== undefined && cachedSum > 0) {
+    // Antigravity ACP reports `inputTokens` exclusively of `cachedReadTokens` / `cachedWriteTokens`
+    // (e.g. inputTokens + cachedReadTokens + outputTokens === totalTokens). Detect exclusive vs
+    // inclusive payloads so cache-hit turns preserve both non-cached input and full cacheRead.
+    const exclusiveTotal = rawInput + cachedSum
+    let isExclusive = false
+    if (derivedInputFromTotal !== undefined) {
+      isExclusive =
+        Math.abs(exclusiveTotal - derivedInputFromTotal) <=
+        Math.abs(rawInput - derivedInputFromTotal)
+    } else if (cachedSum > rawInput) {
+      isExclusive = true
+    } else if (fallbackContext !== undefined) {
+      isExclusive =
+        Math.abs(exclusiveTotal - fallbackContext) < Math.abs(rawInput - fallbackContext)
+    }
+
+    if (isExclusive) {
+      noCache = rawInput
+      cacheRead = rawCacheRead
+      cacheWrite = rawCacheWrite
+      inputTotal = exclusiveTotal
+    } else {
+      inputTotal = rawInput
+      cacheRead = rawCacheRead !== undefined ? Math.min(rawCacheRead, inputTotal) : undefined
+      cacheWrite =
+        rawCacheWrite !== undefined
+          ? Math.min(rawCacheWrite, Math.max(0, inputTotal - (cacheRead ?? 0)))
+          : undefined
+      noCache = Math.max(0, inputTotal - (cacheRead ?? 0) - (cacheWrite ?? 0))
+    }
+  } else {
+    inputTotal = rawInput ?? derivedInputFromTotal ?? fallbackContext
+    cacheRead =
+      rawCacheRead !== undefined && inputTotal !== undefined
+        ? Math.min(rawCacheRead, inputTotal)
+        : rawCacheRead
+    cacheWrite =
+      rawCacheWrite !== undefined && inputTotal !== undefined
+        ? Math.min(rawCacheWrite, Math.max(0, inputTotal - (cacheRead ?? 0)))
+        : rawCacheWrite
+    noCache =
+      inputTotal !== undefined
+        ? Math.max(0, inputTotal - (cacheRead ?? 0) - (cacheWrite ?? 0))
+        : undefined
+  }
+
   const outputTotal = rawOutput
-  const noCache =
-    inputTotal !== undefined
-      ? Math.max(0, inputTotal - (cacheRead ?? 0) - (cacheWrite ?? 0))
-      : undefined
   const text =
     outputTotal !== undefined ? Math.max(0, outputTotal - (reasoning ?? 0)) : undefined
 

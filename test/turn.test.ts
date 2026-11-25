@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
-import { ActiveTurn, formatNativeToolResult, takeSmoothSlice } from "../src/acp/turn.js"
+import { ActiveTurn, buildUsage, formatNativeToolResult, takeSmoothSlice } from "../src/acp/turn.js"
 
 function makeTurn(overrides?: {
   readonly smoothStreaming?: boolean
@@ -192,5 +192,69 @@ describe("smooth streaming pacer (src/acp/turn.ts)", () => {
     })
     expect(typeof huge).toBe("string")
     expect(String(huge)).toContain("... [truncated 4000 chars]")
+  })
+
+  test("buildUsage preserves exclusive agy inputTokens + cachedReadTokens without clamping or zeroing noCache", () => {
+    // Real agy Turn 1 (cache miss)
+    const turn1 = buildUsage({
+      inputTokens: 10_403,
+      outputTokens: 29,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+      thoughtTokens: 27,
+      totalTokens: 10_432,
+    })
+    expect(turn1.inputTokens).toEqual({
+      total: 10_403,
+      noCache: 10_403,
+      cacheRead: 0,
+      cacheWrite: 0,
+    })
+    expect(turn1.outputTokens).toEqual({ total: 29, text: 2, reasoning: 27 })
+
+    // Real agy Turn 2 (cache hit: inputTokens is non-cached only; totalTokens = input + cachedRead + output)
+    const turn2 = buildUsage({
+      inputTokens: 2_146,
+      outputTokens: 25,
+      cachedReadTokens: 8_358,
+      cachedWriteTokens: 0,
+      thoughtTokens: 23,
+      totalTokens: 10_529,
+    })
+    expect(turn2.inputTokens).toEqual({
+      total: 10_504,
+      noCache: 2_146,
+      cacheRead: 8_358,
+      cacheWrite: 0,
+    })
+    expect(turn2.outputTokens).toEqual({ total: 25, text: 2, reasoning: 23 })
+
+    // Exclusive multi-step turn where rawInput > cachedReadTokens and totalTokens equals sum
+    const multiStep = buildUsage({
+      inputTokens: 50_000,
+      cachedReadTokens: 40_000,
+      outputTokens: 5_000,
+      totalTokens: 95_000,
+    })
+    expect(multiStep.inputTokens).toEqual({
+      total: 90_000,
+      noCache: 50_000,
+      cacheRead: 40_000,
+      cacheWrite: undefined,
+    })
+
+    // Inclusive ACP server (inputTokens already includes cachedReadTokens)
+    const inclusive = buildUsage({
+      inputTokens: 10_504,
+      cachedReadTokens: 8_358,
+      outputTokens: 25,
+      totalTokens: 10_529,
+    })
+    expect(inclusive.inputTokens).toEqual({
+      total: 10_504,
+      noCache: 2_146,
+      cacheRead: 8_358,
+      cacheWrite: undefined,
+    })
   })
 })

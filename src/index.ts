@@ -296,19 +296,23 @@ export default Plugin.define({
           }).pipe(Effect.orDie),
       })
 
-      if (cacheStatus.stale) {
+      // Defer startup background workers briefly so OpenCode finishes materializing provider
+      // settings overlays (e.g. binaryPath, prewarm, isolateUserMcp) before spawning agy.
+      if (cacheStatus.stale || registry.settings.prewarm !== false) {
         yield* Effect.forkScoped(
-          Effect.promise(() => registry.refreshModelsInBackground()).pipe(
-            Effect.catch(() => Effect.void),
-          ),
-        )
-      }
-
-      if (registry.settings.prewarm) {
-        yield* Effect.forkScoped(
-          Effect.sync(() => {
-            registry.prewarmStandby()
-          }),
+          Effect.gen(function* () {
+            yield* Effect.sleep("50 millis")
+            yield* syncProviderSettings()
+            if (cacheStatus.stale) {
+              yield* Effect.promise(() => registry.refreshModelsInBackground()).pipe(
+                Effect.catch(() => Effect.void),
+              )
+            }
+            const shouldPrewarm = yield* Effect.promise(() => registry.shouldPrewarmDirectory())
+            if (shouldPrewarm) {
+              registry.prewarmStandby()
+            }
+          }).pipe(Effect.catch(() => Effect.void)),
         )
       }
 
@@ -348,8 +352,11 @@ export default Plugin.define({
       yield* Effect.logInfo("opencode-agy-acp loaded", {
         directory: ctx.location.directory,
         models: registry.getModels().length,
-        codeMode: initialSettings.codeMode,
-        includeDefaultCustomizations: initialSettings.includeDefaultCustomizations,
+        codeMode: registry.settings.codeMode,
+        prewarm: registry.settings.prewarm,
+        includeDefaultCustomizations: registry.settings.includeDefaultCustomizations,
+        isolateUserMcp: registry.settings.isolateUserMcp,
+        maxMcpResultChars: registry.settings.maxMcpResultChars,
       })
     }).pipe(Effect.orDie),
 })

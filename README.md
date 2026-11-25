@@ -9,11 +9,11 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
    - **Hybrid Auto Code Mode by default (`codeMode: "auto"`):** Keeps native `agy` tools fast for local edits/shell (`NATIVE_SHADOWED_TOOLS`) while automatically relaying OpenCode's non-shadowed tools (`execute`, `subagent`, MCP servers) without `--process-per-session` overhead. Supports `extraRelayedTools` / `blockedRelayedTools` overrides or forcing `true` / `false`.
    - **`mcp_oc_execute` & rich media bridging:** Guides `agy` from OpenCode's `execute` docs directly to `mcp_oc_execute`, streams image/file attachments from OpenCode tool results over MCP, and avoids false deadlocks on `activeNativeTools` (`nativeFlushGraceMs`, default 400ms).
    - Full `elicitation/create` → OpenCode `question` bridge works in both Pure ACP and Code Mode.
-3. **Structured Effect concurrency & warm worker pooling:**
-   - Pre-warmed authenticated standby `agy` worker (`prewarm: true` by default) + shared warm side-call worker for isolated `/compact` & judge (`generate`) calls to avoid repeated OAuth startup hops (~1.6s -> ~7ms per new session).
+3. **Structured Effect concurrency & active-only warm worker pooling:**
+   - Active-directory standby pre-warming (`prewarm: "auto"` by default — only prewarms workspaces that recently used `antigravity-acp`, avoiding idle spawns across unused worktrees) + shared warm side-call worker for isolated `/compact` & judge (`generate`) calls (~1.6s -> ~7ms per new session).
    - Per-session `Semaphore(1)` serialization, 5-minute idle worker reaper (`idleTimeoutMs`, preserving `acpSessionId` for `session/resume`), and `retry: false` hook to prevent double-retries.
-4. **MCP isolation (`includeDefaultCustomizations: false` by default):** Prevents each `agy acp` worker from spawning duplicate copies of `~/.gemini` MCP servers.
-5. **Bounded permissions & fixed `stdin.write` error propagation.**
+4. **Real MCP isolation (`isolateUserMcp: true`, `includeDefaultCustomizations: false` by default):** Launches `agy acp` with an isolated `--gemini-dir` (empty `config/mcp_config.json`, symlinked `antigravity-cli/` for OAuth & session resume) so workers never spawn duplicate copies of `~/.gemini` MCP servers or bloat prompts with duplicate tool schemas.
+5. **Bounded permissions, MCP relay compaction (`maxMcpResultChars: 8000`), and accurate usage accounting:** Compacts oversized relayed MCP outputs cleanly below `agy`'s inline truncation threshold (preserving saved-file pointers so `agy` never double-truncates JSON), and handles `agy`'s exclusive `inputTokens` + `cachedReadTokens` accounting accurately.
 6. **Plan mode auto-sync (`defaultMode`, default `"auto"`):** Automatically switches `agy` to `"plan"` when using OpenCode's `plan` agent and back when leaving `plan` (unless explicitly overridden via RPC `setMode`).
 7. **Instruction & Code Mode forwarding (`forwardInstructions`, default `true`):** Forwards OpenCode agent roles, `AGENTS.md`, skills, and Code Mode instructions via ACP `_meta.antigravity.systemPrompt.append` while keeping OpenCode's core system prompt lean.
 8. **Turn fingerprinting & delta catch-up:** Tracks completed turns so cross-model switches append only compact `<conversation-checkpoint>` deltas to the live ACP session, while `/undo` or edits cleanly start a restored session.
@@ -30,9 +30,11 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
         "defaultMode": "auto",
         "forwardInstructions": true,
         "codeMode": "auto",
-        "prewarm": true,
+        "prewarm": "auto",
         "smoothStreaming": true,
         "includeDefaultCustomizations": false,
+        "isolateUserMcp": true,
+        "maxMcpResultChars": 8000,
         "chunkTimeoutMs": 120000,
         "permissionTimeoutMs": 300000,
         "idleTimeoutMs": 300000
@@ -71,10 +73,12 @@ No extra plugin configuration is needed — `codeMode: "auto"` automatically rel
 - `AGY_ACP_DEFAULT_MODE=auto|accept-edits|default|plan`
 - `AGY_ACP_FORWARD_INSTRUCTIONS=true|false`
 - `AGY_ACP_CODE_MODE=auto|true|false`
-- `AGY_ACP_PREWARM=true|false`
+- `AGY_ACP_PREWARM=auto|true|false`
 - `AGY_ACP_SMOOTH_STREAMING=true|false`
 - `AGY_ACP_MAX_SYSTEM_PROMPT_CHARS`
+- `AGY_ACP_MAX_MCP_RESULT_CHARS=8000` (`0` to disable)
 - `AGY_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS=true|false`
+- `AGY_ACP_ISOLATE_USER_MCP=true|false`
 - `AGY_ACP_CHUNK_TIMEOUT_MS`
 - `AGY_ACP_TRACE_LOG=/path/to/trace.jsonl`
 

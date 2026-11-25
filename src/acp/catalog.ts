@@ -312,7 +312,10 @@ export function catalogSignature(models: readonly AcpDiscoveredModel[]): string 
 
 export async function discoverAcpModels(
   cwd: string,
-  settings: Pick<AgySettings, "binaryPath" | "includeDefaultCustomizations" | "startupTimeoutMs" | "traceLogPath">,
+  settings: Pick<
+    AgySettings,
+    "binaryPath" | "includeDefaultCustomizations" | "isolateUserMcp" | "startupTimeoutMs" | "traceLogPath"
+  >,
   io?: AgyIO,
 ): Promise<readonly AcpDiscoveredModel[]> {
   const proc = new AcpProcess({
@@ -320,6 +323,7 @@ export async function discoverAcpModels(
     binaryPath: settings.binaryPath,
     processPerSession: false,
     includeDefaultCustomizations: settings.includeDefaultCustomizations,
+    isolateUserMcp: settings.isolateUserMcp,
     traceLogPath: settings.traceLogPath,
     io,
   })

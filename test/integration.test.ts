@@ -1046,4 +1046,58 @@ describe("SessionRegistry + fake-agy integration", () => {
       fs.rmSync(tmp, { recursive: true, force: true })
     }
   })
+
+  test("18. Auto prewarm skips unused directories, activates after first turn, and drops stale standby on binaryPath change", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-auto-prewarm-"))
+    const argsLog = path.join(tmp, "args.log")
+    const prevArgs = process.env.FAKE_AGY_ARGS_LOG
+    process.env.FAKE_AGY_ARGS_LOG = argsLog
+
+    const { ctx, store } = createMockContext({ cwd: tmp })
+    const reg1 = new SessionRegistry(ctx, {
+      settings: makeSettings({ codeMode: false, prewarm: "auto" }),
+    })
+    try {
+      // Unused directory should not prewarm under prewarm: "auto"
+      expect(await reg1.shouldPrewarmDirectory()).toBe(false)
+      expect(await reg1.shouldPrewarmDirectory(makeSettings({ prewarm: true }))).toBe(true)
+      expect(await reg1.shouldPrewarmDirectory(makeSettings({ prewarm: false }))).toBe(false)
+
+      // After a real turn runs, directory becomes active in storage for subsequent reloads
+      const lm = createAgyLanguageModel(
+        "gemini-4-neon",
+        reg1,
+        makeSettings({ codeMode: false, prewarm: "auto" }),
+      )
+      const { stream } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_auto_prewarm_1" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:PURE_OK] activate" }] }],
+      })
+      expect(textFromParts(await readStreamParts(stream))).toContain("activate")
+      await Bun.sleep(20)
+
+      // A fresh registry instance sharing storage now recognizes this directory as active
+      const reg2 = new SessionRegistry(ctx, {
+        settings: makeSettings({ codeMode: false, prewarm: "auto" }),
+      })
+      try {
+        expect(await reg2.shouldPrewarmDirectory()).toBe(true)
+        // Updating binaryPath disposes any mismatched standby worker
+        reg2.prewarmStandby()
+        await Bun.sleep(60)
+        reg2.updateBaseSettings(
+          makeSettings({ codeMode: false, prewarm: "auto", binaryPath: "/nonexistent/other-agy" }),
+        )
+        await Bun.sleep(40)
+        expect(store.size).toBeGreaterThan(0)
+      } finally {
+        await reg2.disposeAll()
+      }
+    } finally {
+      if (prevArgs === undefined) delete process.env.FAKE_AGY_ARGS_LOG
+      else process.env.FAKE_AGY_ARGS_LOG = prevArgs
+      await reg1.disposeAll()
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
 })

@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import {
   buildSystemPromptAppend,
   extractOpenCodeInstructions,
@@ -7,7 +10,11 @@ import {
   rewriteCodeModeExecuteRefs,
   stripInternalOpencodeNamespace,
 } from "../src/acp/instructions.js"
-import { buildToolDescriptors } from "../src/acp/mcp-relay.js"
+import {
+  buildToolDescriptors,
+  compactMcpText,
+  compactMcpToolResult,
+} from "../src/acp/mcp-relay.js"
 
 describe("instructions forwarding helpers", () => {
   test("drops system[0], core/date, core/environment, Code Mode, and tools.opencode.* in Pure ACP", () => {
@@ -253,5 +260,55 @@ describe("instructions forwarding helpers", () => {
     expect(desc.startsWith("PRIMARY TOOL (OpenCode Full Code Mode)")).toBe(true)
     expect(desc).toContain("Inside `mcp_oc_execute`")
     expect(desc).toContain('Bun.write("a.txt"')
+    expect(forwarded).toContain("Keep return payloads compact")
+    expect(forwarded).toContain(".system_generated/steps/*/output.txt")
+  })
+
+  test("compactMcpToolResult prevents agy double-truncation, preserves saved file pointers, spills raw blobs, and keeps images", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compact-test-"))
+    try {
+      // Small text is untouched
+      expect(compactMcpText("short", { maxChars: 1_000, spillDir: tmp })).toBe("short")
+      // maxChars: 0 disables compaction
+      const longStr = "A".repeat(12_000)
+      expect(compactMcpText(longStr, { maxChars: 0, spillDir: tmp })).toBe(longStr)
+
+      // Preserves OpenCode's saved-file pointer when already truncated by OpenCode
+      const openCodeSaved =
+        `{"head":"start","blob":"${"X".repeat(12_000)}","tail":"end"}\n` +
+        `[showing lines 1-1 of 1 (last line cut); full output saved to /home/user/.local/share/opencode/tool-output/tool_abc123]`
+      const compactedExisting = compactMcpText(openCodeSaved, { maxChars: 2_000, spillDir: tmp })
+      expect(compactedExisting.length).toBeLessThanOrEqual(2_000)
+      expect(compactedExisting).toContain("/home/user/.local/share/opencode/tool-output/tool_abc123")
+      expect(compactedExisting).toContain("do not JSON.parse .system_generated/steps/*/output.txt")
+      expect(compactedExisting).toContain("chars omitted")
+      expect(fs.readdirSync(tmp)).toHaveLength(0)
+
+      // Spills full untruncated payload when no existing saved-file pointer is present
+      const rawJson = JSON.stringify({ items: Array.from({ length: 400 }, (_, i) => ({ i, v: "x".repeat(25) })) })
+      const res = compactMcpToolResult(
+        {
+          content: [
+            { type: "text", text: rawJson },
+            { type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+          ],
+          isError: false,
+        },
+        { maxChars: 2_000, spillDir: tmp },
+      )
+      expect(res.content).toHaveLength(2)
+      expect(res.content[1]).toEqual({ type: "image", data: "ZmFrZQ==", mimeType: "image/png" })
+      const textItem = res.content[0]!
+      expect(textItem.type).toBe("text")
+      if (textItem.type === "text") {
+        expect(textItem.text.length).toBeLessThanOrEqual(2_000)
+        const match = /full raw output saved to ([^\s]+)/.exec(textItem.text)
+        expect(match?.[1]).toBeDefined()
+        const spilled = fs.readFileSync(match![1]!, "utf8")
+        expect(spilled).toBe(rawJson)
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
   })
 })

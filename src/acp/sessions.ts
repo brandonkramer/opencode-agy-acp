@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import type { LanguageModelV3Prompt, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import type { Provider } from "@opencode/schema/provider"
@@ -62,10 +63,18 @@ import {
 import { ActiveTurn, buildUsage } from "./turn.js"
 
 const STORAGE_KEY_PREFIX = "antigravity-acp:session:"
+const ACTIVE_DIR_STORAGE_KEY_PREFIX = "antigravity-acp:active-dir:"
+const ACTIVE_DIR_TTL_MS = 24 * 60 * 60 * 1000
+const ACTIVE_DIR_WRITE_THROTTLE_MS = 5 * 60 * 1000
 const COOLDOWN_STORAGE_KEY = "antigravity-acp:cooldown"
 const MODEL_CATALOG_STORAGE_KEY = "antigravity-acp:model-catalog:v1"
 const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000
 const COOLDOWN_BUCKETS: readonly CooldownBucket[] = ["global", "claude-gpt", "gemini", "other"]
+
+function activeDirStorageKey(directory: string): string {
+  const digest = createHash("sha256").update(directory).digest("hex").slice(0, 16)
+  return `${ACTIVE_DIR_STORAGE_KEY_PREFIX}${digest}`
+}
 
 export interface SessionContextSnapshot {
   readonly agent: string
@@ -140,6 +149,8 @@ export class SessionRegistry {
   private catalogUpdatedAt = 0
   private catalogDiscoveryPromise?: Promise<readonly AcpDiscoveredModel[]>
   private cooldownLoadPromise?: Promise<void>
+  private directoryUsedInProcess = false
+  private lastActiveDirWriteAt = 0
   private disposed = false
 
   constructor(
@@ -149,6 +160,7 @@ export class SessionRegistry {
     this.baseSettings = options.settings
     this.mcpRelay = new McpRelayServer({
       getTools: (sessionID) => this.entries.get(sessionID)?.contextSnapshot?.mcpDescriptors ?? [],
+      getMaxResultChars: () => this.baseSettings.maxMcpResultChars,
       callTool: (sessionID, toolName, args, signal) =>
         this.handleIncomingMcpCall(sessionID, toolName, args, signal),
     })
@@ -162,13 +174,25 @@ export class SessionRegistry {
     return JSON.stringify([
       settings.binaryPath ?? "",
       settings.includeDefaultCustomizations,
+      settings.isolateUserMcp,
       settings.extraDirs,
       settings.traceLogPath ?? "",
     ])
   }
 
   updateBaseSettings(settings: AgySettings): void {
+    const nextSig = this.spawnSignatureFor(settings)
     this.baseSettings = settings
+    if (this.standby && this.standby.spawnSignature !== nextSig) {
+      void this.disposeStandby()
+    }
+    if (
+      this.sideCallWorker &&
+      this.sideCallWorker.activeCalls === 0 &&
+      this.sideCallWorker.spawnSignature !== nextSig
+    ) {
+      void this.disposeSideCallWorker()
+    }
     for (const entry of this.entries.values()) {
       if (!entry.codeModeExplicit) {
         entry.codeModeEnabled = entry.contextSnapshot
@@ -179,6 +203,35 @@ export class SessionRegistry {
         entry.mode = entry.contextSnapshot?.agent === "plan" ? "plan" : settings.defaultMode
       }
     }
+  }
+
+  async shouldPrewarmDirectory(settings: AgySettings = this.baseSettings): Promise<boolean> {
+    if (settings.prewarm === true) return true
+    if (settings.prewarm === false) return false
+    if (this.directoryUsedInProcess) return true
+    try {
+      const val = await Effect.runPromise(
+        this.ctx.storage.get(activeDirStorageKey(this.ctx.location.directory)),
+      )
+      if (isRecord(val) && typeof val.lastUsedAt === "number") {
+        return Date.now() - val.lastUsedAt <= ACTIVE_DIR_TTL_MS
+      }
+    } catch {}
+    return false
+  }
+
+  markDirectoryActive(directory: string = this.ctx.location.directory): void {
+    this.directoryUsedInProcess = true
+    const now = Date.now()
+    if (now - this.lastActiveDirWriteAt < ACTIVE_DIR_WRITE_THROTTLE_MS) return
+    this.lastActiveDirWriteAt = now
+    try {
+      Effect.runFork(
+        this.ctx.storage
+          .set(activeDirStorageKey(directory), { lastUsedAt: now })
+          .pipe(Effect.catch(() => Effect.void)),
+      )
+    } catch {}
   }
 
   getModels(): readonly AcpDiscoveredModel[] {
@@ -230,7 +283,7 @@ export class SessionRegistry {
   }
 
   prewarmStandby(runtimeSettings: AgySettings = this.baseSettings): void {
-    if (this.disposed || !runtimeSettings.prewarm || this.standby || this.activeProcs.size >= 4) {
+    if (this.disposed || runtimeSettings.prewarm === false || this.standby || this.activeProcs.size >= 4) {
       return
     }
     const cwd = this.ctx.location.directory
@@ -240,6 +293,7 @@ export class SessionRegistry {
       binaryPath: runtimeSettings.binaryPath,
       processPerSession: false,
       includeDefaultCustomizations: runtimeSettings.includeDefaultCustomizations,
+      isolateUserMcp: runtimeSettings.isolateUserMcp,
       dangerouslySkipPermissions: false,
       extraDirs: runtimeSettings.extraDirs,
       traceLogPath: runtimeSettings.traceLogPath,
@@ -299,7 +353,7 @@ export class SessionRegistry {
       await sb.proc.dispose().catch(() => {})
       return undefined
     }
-    if (runtimeSettings.prewarm) {
+    if (runtimeSettings.prewarm !== false) {
       this.prewarmStandby(runtimeSettings)
     }
     return sb.proc
@@ -343,6 +397,7 @@ export class SessionRegistry {
             binaryPath: runtimeSettings.binaryPath,
             processPerSession: false,
             includeDefaultCustomizations: runtimeSettings.includeDefaultCustomizations,
+            isolateUserMcp: runtimeSettings.isolateUserMcp,
             dangerouslySkipPermissions: false,
             extraDirs: runtimeSettings.extraDirs,
             traceLogPath: runtimeSettings.traceLogPath,
@@ -1017,6 +1072,7 @@ export class SessionRegistry {
         binaryPath: runtimeSettings.binaryPath,
         processPerSession: false,
         includeDefaultCustomizations: runtimeSettings.includeDefaultCustomizations,
+        isolateUserMcp: runtimeSettings.isolateUserMcp,
         dangerouslySkipPermissions: false,
         extraDirs: runtimeSettings.extraDirs,
         traceLogPath: runtimeSettings.traceLogPath,
@@ -1319,6 +1375,7 @@ export class SessionRegistry {
 
     const entry = this.getOrCreateEntry(input.sessionID)
     this.clearIdleTimer(entry)
+    this.markDirectoryActive(entry.cwd)
 
     // Immediate continuation path when OpenCode finishes executing parked MCP / question calls.
     const existingTurn = entry.activeTurn

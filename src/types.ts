@@ -23,6 +23,8 @@ export type RequestKind = "primary" | "compaction" | "generate"
 
 export type CodeModeSetting = boolean | "auto"
 
+export type PrewarmSetting = boolean | "auto"
+
 export type AcpAuthMethodId =
   | "oauth-personal"
   | "oauth-business"
@@ -37,12 +39,14 @@ export interface AgySettings {
   readonly defaultMode: AcpMode
   readonly forwardInstructions: boolean
   readonly codeMode: CodeModeSetting
-  readonly prewarm: boolean
+  readonly prewarm: PrewarmSetting
   readonly smoothStreaming: boolean
   readonly maxSystemPromptChars: number
+  readonly maxMcpResultChars: number
   readonly extraRelayedTools: readonly string[]
   readonly blockedRelayedTools: readonly string[]
   readonly includeDefaultCustomizations: boolean
+  readonly isolateUserMcp: boolean
   readonly startupTimeoutMs: number
   readonly chunkTimeoutMs: number
   readonly settleTimeoutMs: number
@@ -57,12 +61,14 @@ export const DEFAULT_SETTINGS: AgySettings = {
   defaultMode: "auto",
   forwardInstructions: true,
   codeMode: "auto",
-  prewarm: true,
+  prewarm: "auto",
   smoothStreaming: true,
   maxSystemPromptChars: 120_000,
+  maxMcpResultChars: 8_000,
   extraRelayedTools: [],
   blockedRelayedTools: [],
   includeDefaultCustomizations: false,
+  isolateUserMcp: true,
   startupTimeoutMs: 30_000,
   chunkTimeoutMs: 120_000,
   settleTimeoutMs: 3_000,
@@ -87,6 +93,17 @@ function readPositiveInt(value: unknown): number | undefined {
   return undefined
 }
 
+function readNonNegativeInt(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value)
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value.trim())
+    if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed)
+  }
+  return undefined
+}
+
 function readBool(value: unknown): boolean | undefined {
   if (typeof value === "boolean") return value
   if (typeof value === "string") {
@@ -107,6 +124,17 @@ function readAcpMode(value: unknown): AcpMode | undefined {
 }
 
 function readCodeMode(value: unknown): CodeModeSetting | undefined {
+  if (typeof value === "boolean") return value
+  if (typeof value === "string") {
+    const norm = value.trim().toLowerCase()
+    if (norm === "auto") return "auto"
+    const bool = readBool(norm)
+    if (bool !== undefined) return bool
+  }
+  return undefined
+}
+
+function readPrewarm(value: unknown): PrewarmSetting | undefined {
   if (typeof value === "boolean") return value
   if (typeof value === "string") {
     const norm = value.trim().toLowerCase()
@@ -149,7 +177,7 @@ export function resolveSettings(
       readBool(env.AGY_ACP_FORWARD_INSTRUCTIONS) ??
       base.forwardInstructions,
     codeMode: readCodeMode(rawSettings.codeMode) ?? readCodeMode(env.AGY_ACP_CODE_MODE) ?? base.codeMode,
-    prewarm: readBool(rawSettings.prewarm) ?? readBool(env.AGY_ACP_PREWARM) ?? base.prewarm,
+    prewarm: readPrewarm(rawSettings.prewarm) ?? readPrewarm(env.AGY_ACP_PREWARM) ?? base.prewarm,
     smoothStreaming:
       readBool(rawSettings.smoothStreaming) ??
       readBool(env.AGY_ACP_SMOOTH_STREAMING) ??
@@ -158,12 +186,20 @@ export function resolveSettings(
       readPositiveInt(rawSettings.maxSystemPromptChars) ??
       readPositiveInt(env.AGY_ACP_MAX_SYSTEM_PROMPT_CHARS) ??
       base.maxSystemPromptChars,
+    maxMcpResultChars:
+      readNonNegativeInt(rawSettings.maxMcpResultChars) ??
+      readNonNegativeInt(env.AGY_ACP_MAX_MCP_RESULT_CHARS) ??
+      base.maxMcpResultChars,
     extraRelayedTools,
     blockedRelayedTools,
     includeDefaultCustomizations:
       readBool(rawSettings.includeDefaultCustomizations) ??
       readBool(env.AGY_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS) ??
       base.includeDefaultCustomizations,
+    isolateUserMcp:
+      readBool(rawSettings.isolateUserMcp) ??
+      readBool(env.AGY_ACP_ISOLATE_USER_MCP) ??
+      base.isolateUserMcp,
     startupTimeoutMs:
       readPositiveInt(rawSettings.startupTimeoutMs) ??
       readPositiveInt(env.AGY_ACP_STARTUP_TIMEOUT_MS) ??
