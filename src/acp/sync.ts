@@ -30,6 +30,7 @@ export interface PromptGroup {
   readonly userPreview: string
   readonly assistantPreview: string
   readonly assistantTranscript: string
+  readonly assistantTextChunks: readonly string[]
 }
 
 export type SyncDecision =
@@ -153,6 +154,7 @@ function extractTrailingAssistantInfo(
   readonly hash: string
   readonly preview: string
   readonly transcript: string
+  readonly textChunks: readonly string[]
 } {
   const textChunks: string[] = []
   const transcriptLines: string[] = []
@@ -186,7 +188,7 @@ function extractTrailingAssistantInfo(
   }
   const hash = hashAssistantTextBlocks(textChunks)
   const transcript = transcriptLines.join("\n").trim()
-  return { hash, preview: previewText(transcript), transcript }
+  return { hash, preview: previewText(transcript), transcript, textChunks }
 }
 
 /** Group a prompt into (consecutive userMessages, trailing assistant/tool messages) turns with hashes. */
@@ -222,6 +224,7 @@ export function fingerprintGroups(prompt: LanguageModelV3Prompt): PromptGroup[] 
       userPreview: userInfo.preview,
       assistantPreview: assistantInfo.preview,
       assistantTranscript: assistantInfo.transcript,
+      assistantTextChunks: assistantInfo.textChunks,
     }
   })
 }
@@ -342,6 +345,83 @@ export function buildSavedHistory(params: {
       ...(assistantNormalized ? { assistantPreview: previewText(assistantNormalized) } : {}),
     })
   }
+  return turns
+}
+
+/**
+ * Extract newly appended user/synthetic messages that arrived in `nextGroups`
+ * while an active ACP turn was parked waiting for a relayed OpenCode tool.
+ */
+export function extractNewMidTurnUserMessages(
+  prevGroups: readonly PromptGroup[],
+  nextGroups: readonly PromptGroup[],
+): LanguageModelV3Prompt[number][] {
+  if (nextGroups.length === 0) return []
+  if (nextGroups.length > prevGroups.length) {
+    const added: LanguageModelV3Prompt[number][] = []
+    for (let i = prevGroups.length; i < nextGroups.length; i++) {
+      added.push(...nextGroups[i]!.userMessages)
+    }
+    return added
+  }
+  if (nextGroups.length === prevGroups.length) {
+    const prevLast = prevGroups[prevGroups.length - 1]
+    const nextLast = nextGroups[nextGroups.length - 1]
+    if (prevLast && nextLast && nextLast.userMessages.length > prevLast.userMessages.length) {
+      return nextLast.userMessages.slice(prevLast.userMessages.length)
+    }
+  }
+  return []
+}
+
+/** Format mid-turn queued user/synthetic messages for in-band delivery via MCP tool result. */
+export function formatMidTurnUserMessages(
+  messages: readonly LanguageModelV3Prompt[number][],
+): string | undefined {
+  if (messages.length === 0) return undefined
+  const transcript = hashUserMessages(messages).transcript.trim()
+  if (!transcript) return undefined
+  return [
+    "<queued-user-message>",
+    "The following message(s) arrived while your tool was running. Handle them now alongside your current work:",
+    transcript,
+    "</queued-user-message>",
+  ].join("\n")
+}
+
+/**
+ * Persist turn fingerprints directly from the turn's latest prompt groups (which
+ * include any mid-turn user/synthetic messages) plus assistant text streamed after
+ * the last parked resumption, preventing false `diverged` session resets.
+ */
+export function buildSavedHistoryFromGroups(params: {
+  readonly groups: readonly PromptGroup[]
+  readonly trailingAssistantTextBlocks: readonly string[]
+}): PersistedTurn[] {
+  if (params.groups.length === 0) return []
+  const turns: PersistedTurn[] = []
+  for (let i = 0; i < params.groups.length - 1; i++) {
+    const g = params.groups[i]!
+    turns.push({
+      userHash: g.userHash,
+      assistantHash: g.assistantHash,
+      ...(g.userPreview ? { userPreview: g.userPreview } : {}),
+      ...(g.assistantPreview ? { assistantPreview: g.assistantPreview } : {}),
+    })
+  }
+  const last = params.groups[params.groups.length - 1]!
+  const combinedChunks = [...last.assistantTextChunks, ...params.trailingAssistantTextBlocks]
+  const assistantNormalized = normalizeAssistantBlocks(combinedChunks)
+  turns.push({
+    userHash: last.userHash,
+    assistantHash: hashAssistantTextBlocks(combinedChunks),
+    ...(last.userPreview ? { userPreview: last.userPreview } : {}),
+    ...(assistantNormalized
+      ? { assistantPreview: previewText(assistantNormalized) }
+      : last.assistantPreview
+        ? { assistantPreview: last.assistantPreview }
+        : {}),
+  })
   return turns
 }
 

@@ -53,11 +53,15 @@ import { elicitationToQuestions, parseQuestionToolAnswers } from "./question.js"
 import {
   buildCheckpointPromptBlocks,
   buildSavedHistory,
+  buildSavedHistoryFromGroups,
   buildSideCallPromptBlocks,
   decideSync,
+  extractNewMidTurnUserMessages,
   fingerprintGroups,
+  formatMidTurnUserMessages,
   parsePersistedRecord,
   type PersistedSessionRecord,
+  type PromptGroup,
   type SyncDecision,
 } from "./sync.js"
 import { ActiveTurn, buildUsage } from "./turn.js"
@@ -70,6 +74,40 @@ const COOLDOWN_STORAGE_KEY = "antigravity-acp:cooldown"
 const MODEL_CATALOG_STORAGE_KEY = "antigravity-acp:model-catalog:v1"
 const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000
 const COOLDOWN_BUCKETS: readonly CooldownBucket[] = ["global", "claude-gpt", "gemini", "other"]
+
+interface SharedCatalogEntry {
+  models?: readonly AcpDiscoveredModel[]
+  updatedAt: number
+  inFlight?: Promise<readonly AcpDiscoveredModel[]>
+}
+
+const sharedCatalogCache = new Map<string, SharedCatalogEntry>()
+const sharedIoIds = new WeakMap<AgyIO, number>()
+let nextSharedIoId = 1
+
+/** Clear process-wide catalog cache (used by tests). */
+export function resetSharedCatalogCacheForTests(): void {
+  sharedCatalogCache.clear()
+}
+
+function sharedCatalogKeyFor(settings: AgySettings, io?: AgyIO): string {
+  let ioTag = "default"
+  if (io) {
+    let id = sharedIoIds.get(io)
+    if (id === undefined) {
+      id = nextSharedIoId++
+      sharedIoIds.set(io, id)
+    }
+    ioTag = `io:${id}`
+  }
+  return JSON.stringify([
+    ioTag,
+    settings.binaryPath ?? "",
+    settings.includeDefaultCustomizations,
+    settings.isolateUserMcp,
+    settings.traceLogPath ?? "",
+  ])
+}
 
 function activeDirStorageKey(directory: string): string {
   const digest = createHash("sha256").update(directory).digest("hex").slice(0, 16)
@@ -106,6 +144,8 @@ interface Entry {
   persistedRecord?: PersistedSessionRecord
   contextSnapshot?: SessionContextSnapshot
   activeTurn?: ActiveTurn
+  activeTurnGroups?: readonly PromptGroup[]
+  lastContextUsed?: number
   settlingPrompt?: Promise<void>
   acpToolsSignature?: string
   idleTimer?: ReturnType<typeof setTimeout>
@@ -530,6 +570,7 @@ export class SessionRegistry {
       entry.lastModelId = undefined
       entry.lastModeApplied = undefined
       entry.lastSystemPromptHash = undefined
+      entry.lastContextUsed = undefined
     }
     entry.settlingPrompt = undefined
     if (!proc) return
@@ -545,6 +586,13 @@ export class SessionRegistry {
   }
 
   async loadCachedModels(): Promise<{ readonly stale: boolean }> {
+    const cacheKey = sharedCatalogKeyFor(this.baseSettings, this.options.io)
+    const shared = sharedCatalogCache.get(cacheKey)
+    if (shared?.models && shared.models.length > 0 && Date.now() - shared.updatedAt <= MODEL_CATALOG_TTL_MS) {
+      this.catalog = shared.models
+      this.catalogUpdatedAt = shared.updatedAt
+      return { stale: false }
+    }
     try {
       const raw = await Effect.runPromise(this.ctx.storage.get(MODEL_CATALOG_STORAGE_KEY))
       if (isRecord(raw) && isValidCatalog(raw.models)) {
@@ -576,44 +624,79 @@ export class SessionRegistry {
       return { models: this.catalog, changed: false }
     }
 
-    if (!this.catalogDiscoveryPromise) {
-      this.catalogDiscoveryPromise = (async () => {
-        if (this.ctx.provider?.get) {
-          try {
-            const info = await Effect.runPromise(
-              this.ctx.provider.get({ providerID: PROVIDER_ID as Provider.ID }).pipe(Effect.option),
-            )
-            if (info._tag === "Some") {
-              this.updateBaseSettings(
-                resolveSettings(
-                  info.value.data as unknown as Record<string, unknown>,
-                  process.env,
-                  this.baseSettings,
-                ),
-              )
-            }
-          } catch {}
-        }
-        const discovered = await discoverAcpModels(
-          this.ctx.location.directory,
-          this.baseSettings,
-          this.options.io,
+    if (this.ctx.provider?.get) {
+      try {
+        const info = await Effect.runPromise(
+          this.ctx.provider.get({ providerID: PROVIDER_ID as Provider.ID }).pipe(Effect.option),
         )
-        const normalized = normalizeCatalog(discovered)
-        if (normalized.length > 0) {
-          const updatedAt = Date.now()
-          this.catalogUpdatedAt = updatedAt
-          await this.persistCatalog(normalized, updatedAt)
+        if (info._tag === "Some") {
+          this.updateBaseSettings(
+            resolveSettings(
+              info.value.data as unknown as Record<string, unknown>,
+              process.env,
+              this.baseSettings,
+            ),
+          )
         }
-        return normalized
-      })().finally(() => {
-        this.catalogDiscoveryPromise = undefined
-      })
+      } catch {}
     }
 
-    const normalized = await this.catalogDiscoveryPromise
+    const cacheKey = sharedCatalogKeyFor(this.baseSettings, this.options.io)
+    const existingShared = sharedCatalogCache.get(cacheKey)
+    if (
+      !options?.force &&
+      existingShared?.models &&
+      existingShared.models.length > 0 &&
+      Date.now() - existingShared.updatedAt <= MODEL_CATALOG_TTL_MS
+    ) {
+      const changed = catalogSignature(this.catalog) !== catalogSignature(existingShared.models)
+      this.catalog = existingShared.models
+      this.catalogUpdatedAt = existingShared.updatedAt
+      return { models: existingShared.models, changed }
+    }
+
+    let inFlight = !options?.force ? existingShared?.inFlight : undefined
+    if (!inFlight) {
+      if (!this.catalogDiscoveryPromise) {
+        const settingsSnapshot = this.baseSettings
+        const discovery = (async () => {
+          const discovered = await discoverAcpModels(
+            this.ctx.location.directory,
+            settingsSnapshot,
+            this.options.io,
+          )
+          const normalized = normalizeCatalog(discovered)
+          if (normalized.length > 0) {
+            const updatedAt = Date.now()
+            this.catalogUpdatedAt = updatedAt
+            sharedCatalogCache.set(cacheKey, { models: normalized, updatedAt })
+            await this.persistCatalog(normalized, updatedAt)
+          }
+          return normalized
+        })().finally(() => {
+          this.catalogDiscoveryPromise = undefined
+          const cur = sharedCatalogCache.get(cacheKey)
+          if (cur?.inFlight === discovery) {
+            cur.inFlight = undefined
+          }
+        })
+        this.catalogDiscoveryPromise = discovery
+        sharedCatalogCache.set(cacheKey, {
+          models: existingShared?.models,
+          updatedAt: existingShared?.updatedAt ?? 0,
+          inFlight: discovery,
+        })
+      }
+      inFlight = this.catalogDiscoveryPromise
+    }
+
+    const normalized = await inFlight
     if (normalized.length === 0) {
       return { models: this.catalog, changed: false }
+    }
+    const latestShared = sharedCatalogCache.get(cacheKey)
+    if (latestShared && latestShared.updatedAt > this.catalogUpdatedAt) {
+      this.catalogUpdatedAt = latestShared.updatedAt
     }
     const changed = catalogSignature(this.catalog) !== catalogSignature(normalized)
     this.catalog = normalized
@@ -902,7 +985,10 @@ export class SessionRegistry {
       await entry.proc.cancel(entry.acpSessionId).catch(() => false)
     }
     turn.finishWithError(new Error(reason))
-    if (entry.activeTurn === turn) entry.activeTurn = undefined
+    if (entry.activeTurn === turn) {
+      entry.activeTurn = undefined
+      entry.activeTurnGroups = undefined
+    }
     await this.awaitSettlingOrKillLocked(entry)
   }
 
@@ -939,6 +1025,7 @@ export class SessionRegistry {
     entry.lastModelId = undefined
     entry.lastModeApplied = undefined
     entry.lastSystemPromptHash = undefined
+    entry.lastContextUsed = undefined
     entry.persistedRecord = undefined
     entry.lastError = null
     await this.runStorageRemove(entry.sessionID)
@@ -1039,6 +1126,7 @@ export class SessionRegistry {
         entry.lastModelId = undefined
         entry.lastModeApplied = undefined
         entry.lastSystemPromptHash = systemPromptHash
+        entry.lastContextUsed = undefined
         void this.runStorageSetRecord(entry, {
           version: 1,
           acpSessionId: entry.acpSessionId,
@@ -1132,6 +1220,9 @@ export class SessionRegistry {
     entry.acpToolsSignature = this.acpToolsSignatureFor(entry)
     entry.lastError = null
     entry.lastSystemPromptHash = systemPromptHash
+    if (freshSession) {
+      entry.lastContextUsed = undefined
+    }
     void this.runStorageSetRecord(entry, {
       version: 1,
       acpSessionId: entry.acpSessionId,
@@ -1142,12 +1233,21 @@ export class SessionRegistry {
 
     if (res.models?.availableModels?.length || res.configOptions?.length) {
       const live = normalizeCatalog(buildModelCatalog(res))
-      if (live.length > 0 && catalogSignature(live) !== catalogSignature(this.catalog)) {
+      if (live.length > 0) {
         const updatedAt = Date.now()
-        this.catalog = live
+        const cacheKey = sharedCatalogKeyFor(runtimeSettings, this.options.io)
+        const existingShared = sharedCatalogCache.get(cacheKey)
+        sharedCatalogCache.set(cacheKey, {
+          models: live,
+          updatedAt,
+          inFlight: existingShared?.inFlight,
+        })
         this.catalogUpdatedAt = updatedAt
-        void this.persistCatalog(live, updatedAt)
-        if (!this.disposed) this.options.onCatalogChanged?.()
+        if (catalogSignature(live) !== catalogSignature(this.catalog)) {
+          this.catalog = live
+          void this.persistCatalog(live, updatedAt)
+          if (!this.disposed) this.options.onCatalogChanged?.()
+        }
       }
     }
 
@@ -1312,10 +1412,12 @@ export class SessionRegistry {
     entry.lastModelId = undefined
     entry.lastModeApplied = undefined
     entry.lastSystemPromptHash = undefined
+    entry.lastContextUsed = undefined
     entry.settlingPrompt = undefined
     if (entry.activeTurn) {
       const turn = entry.activeTurn
       entry.activeTurn = undefined
+      entry.activeTurnGroups = undefined
       turn.finishWithError(new Error(entry.lastError))
     }
     this.notifyChanged(entry.sessionID)
@@ -1382,8 +1484,22 @@ export class SessionRegistry {
     if (existingTurn && existingTurn.dispatchedCallIds.size > 0) {
       const matched = extractToolResultsFromPrompt(input.prompt, existingTurn.dispatchedCallIds)
       if (matched.size > 0) {
+        const prevGroups = entry.activeTurnGroups ?? []
+        const nextGroups = fingerprintGroups(input.prompt)
+        const newMidTurnUsers = extractNewMidTurnUserMessages(prevGroups, nextGroups)
+        const queuedUserMessage = formatMidTurnUserMessages(newMidTurnUsers)
+        const lastNextGroup = nextGroups[nextGroups.length - 1]
+        if (
+          nextGroups.length > prevGroups.length ||
+          (lastNextGroup && lastNextGroup.assistantTextChunks.length > 0)
+        ) {
+          existingTurn.resetStepTextBlocks()
+        }
+        if (nextGroups.length > 0) {
+          entry.activeTurnGroups = nextGroups
+        }
         return existingTurn.createBoundStream(input.abortSignal, () => {
-          existingTurn.resumeWithToolResults(matched)
+          existingTurn.resumeWithToolResults(matched, queuedUserMessage)
         })
       }
     }
@@ -1579,11 +1695,21 @@ export class SessionRegistry {
     const persistTurnRecord = () => {
       if (recordPersisted || this.disposed || entry.generation !== turnGeneration) return
       recordPersisted = true
-      const turns = buildSavedHistory({
-        priorGroups,
-        currentUserMessages,
-        assistantTextBlocks: turn.assistantTextBlocks,
-      })
+      if (turn.latestContextUsed !== undefined && turn.latestContextUsed > 0) {
+        entry.lastContextUsed = turn.latestContextUsed
+      }
+      const finalGroups = entry.activeTurnGroups ?? groups
+      const turns =
+        finalGroups.length > 0
+          ? buildSavedHistoryFromGroups({
+              groups: finalGroups,
+              trailingAssistantTextBlocks: turn.stepAssistantTextBlocks,
+            })
+          : buildSavedHistory({
+              priorGroups,
+              currentUserMessages,
+              assistantTextBlocks: turn.assistantTextBlocks,
+            })
       void this.runStorageSetRecord(entry, {
         version: 1,
         acpSessionId,
@@ -1598,6 +1724,7 @@ export class SessionRegistry {
       resumeWatchdog: () => proc.resumeWatchdog(),
       nativeFlushGraceMs: runtimeSettings.nativeFlushGraceMs,
       smoothStreaming: runtimeSettings.smoothStreaming,
+      initialContextUsed: entry.lastContextUsed,
       getKnownRelayedNames: () =>
         new Set(entry.contextSnapshot?.mcpDescriptors.map((d) => d.name) ?? []),
       onInterruptRequested: (reason) => {
@@ -1607,7 +1734,10 @@ export class SessionRegistry {
         if (!turn.promptError && !turn.abortedOnApiError) {
           persistTurnRecord()
         }
-        if (entry.activeTurn === turn) entry.activeTurn = undefined
+        if (entry.activeTurn === turn) {
+          entry.activeTurn = undefined
+          entry.activeTurnGroups = undefined
+        }
         this.notifyChanged(input.sessionID)
       },
       onApiErrorText: (text) => {
@@ -1615,6 +1745,7 @@ export class SessionRegistry {
       },
     })
     entry.activeTurn = turn
+    entry.activeTurnGroups = groups
     this.notifyChanged(input.sessionID)
 
     return turn.createBoundStream(input.abortSignal, () => {
@@ -1640,7 +1771,10 @@ export class SessionRegistry {
           if (turn.dispatchedCallIds.size === 0 && turn.hasController) {
             persistTurnRecord()
             turn.finalizeStop()
-            if (entry.activeTurn === turn) entry.activeTurn = undefined
+            if (entry.activeTurn === turn) {
+              entry.activeTurn = undefined
+              entry.activeTurnGroups = undefined
+            }
             this.notifyChanged(input.sessionID)
           }
         })
@@ -1664,7 +1798,10 @@ export class SessionRegistry {
 
           entry.lastError = error.message
           turn.finishWithError(error)
-          if (entry.activeTurn === turn) entry.activeTurn = undefined
+          if (entry.activeTurn === turn) {
+            entry.activeTurn = undefined
+            entry.activeTurnGroups = undefined
+          }
           this.notifyChanged(input.sessionID)
         })
     })
@@ -1843,6 +1980,7 @@ export class SessionRegistry {
       entry.acpToolsSignature = undefined
       entry.lastModelId = undefined
       entry.lastModeApplied = undefined
+      entry.lastContextUsed = undefined
       entry.settlingPrompt = undefined
     }
     await this.runStorageRemove(entry.sessionID)
@@ -1853,7 +1991,10 @@ export class SessionRegistry {
     })
     proc.killImmediate()
     turn.finishWithError(stallError)
-    if (entry.activeTurn === turn) entry.activeTurn = undefined
+    if (entry.activeTurn === turn) {
+      entry.activeTurn = undefined
+      entry.activeTurnGroups = undefined
+    }
     this.notifyChanged(entry.sessionID)
   }
 
@@ -1877,6 +2018,7 @@ export class SessionRegistry {
         entry.acpToolsSignature = undefined
         entry.lastModelId = undefined
         entry.lastModeApplied = undefined
+        entry.lastContextUsed = undefined
         entry.settlingPrompt = undefined
       }
       if (!proc.isClosed) {
@@ -1901,7 +2043,10 @@ export class SessionRegistry {
         true,
       )
     }
-    if (entry.activeTurn === turn) entry.activeTurn = undefined
+    if (entry.activeTurn === turn) {
+      entry.activeTurn = undefined
+      entry.activeTurnGroups = undefined
+    }
     this.notifyChanged(entry.sessionID)
   }
 
@@ -1917,6 +2062,7 @@ export class SessionRegistry {
           true,
         )
         entry.activeTurn = undefined
+        entry.activeTurnGroups = undefined
       }
     }
 

@@ -213,6 +213,86 @@ export function buildUsage(
   }
 }
 
+/** Build an incremental per-step usage estimate from `usage_update.used` for intermediate tool-calls flushes. */
+export function buildStepUsage(
+  contextUsed: number,
+  prevContextUsed = 0,
+): LanguageModelV3Usage {
+  const total = Math.max(0, Math.floor(contextUsed))
+  const cacheRead = prevContextUsed > 0 ? Math.min(Math.floor(prevContextUsed), total) : 0
+  const noCache = Math.max(0, total - cacheRead)
+  return {
+    inputTokens: {
+      total,
+      noCache,
+      cacheRead,
+      cacheWrite: 0,
+    },
+    outputTokens: {
+      total: undefined,
+      text: undefined,
+      reasoning: undefined,
+    },
+  }
+}
+
+/**
+ * Normalize final turn usage so multi-step cumulative `session/prompt` totals from `agy`
+ * never inflate the final assistant message past the actual single-step context occupancy
+ * (`usage_update.used`), which OpenCode uses for its context meter and auto-compaction trigger.
+ */
+export function buildFinalTurnUsage(params: {
+  readonly raw?: AcpUsagePayload
+  readonly activeContextUsed?: number
+  readonly emittedIntermediateInput?: number
+  readonly emittedIntermediateCacheRead?: number
+}): LanguageModelV3Usage {
+  const base = buildUsage(params.raw, params.activeContextUsed)
+  const ctxUsed = params.activeContextUsed
+  const rawInTotal = base.inputTokens.total
+  if (
+    ctxUsed === undefined ||
+    !Number.isFinite(ctxUsed) ||
+    ctxUsed <= 0 ||
+    rawInTotal === undefined ||
+    rawInTotal <= ctxUsed
+  ) {
+    return base
+  }
+
+  const windowTokens = Math.floor(ctxUsed)
+  const rawOutTotal = base.outputTokens.total ?? 0
+  const finalInputTotal = Math.max(0, windowTokens - Math.min(rawOutTotal, windowTokens))
+  const rawCacheRead = base.inputTokens.cacheRead ?? 0
+  const rawCacheWrite = base.inputTokens.cacheWrite ?? 0
+  const emittedIn = params.emittedIntermediateInput ?? 0
+  const emittedCr = params.emittedIntermediateCacheRead ?? 0
+
+  let cacheRead = 0
+  let cacheWrite = 0
+  if (emittedIn > 0 && rawCacheRead >= emittedCr) {
+    cacheRead = Math.min(finalInputTotal, rawCacheRead - emittedCr)
+    cacheWrite = Math.min(Math.max(0, finalInputTotal - cacheRead), rawCacheWrite)
+  } else if (rawInTotal > 0) {
+    cacheRead = Math.min(finalInputTotal, Math.round(finalInputTotal * (rawCacheRead / rawInTotal)))
+    cacheWrite = Math.min(
+      Math.max(0, finalInputTotal - cacheRead),
+      Math.round(finalInputTotal * (rawCacheWrite / rawInTotal)),
+    )
+  }
+  const noCache = Math.max(0, finalInputTotal - cacheRead - cacheWrite)
+
+  return {
+    inputTokens: {
+      total: finalInputTotal,
+      noCache,
+      cacheRead: base.inputTokens.cacheRead !== undefined ? cacheRead : undefined,
+      cacheWrite: base.inputTokens.cacheWrite !== undefined ? cacheWrite : undefined,
+    },
+    outputTokens: base.outputTokens,
+  }
+}
+
 /** Extract and normalize a native ACP tool result into compact, TUI-friendly output. */
 export function formatNativeToolResult(update: AcpSessionUpdate): NonNullable<JSONValue> {
   const rawOutput = update.rawOutput
@@ -286,6 +366,7 @@ export interface TurnCallbacks {
   readonly nativeFlushGraceMs: number
   readonly smoothStreaming?: boolean
   readonly smoothIntervalMs?: number
+  readonly initialContextUsed?: number
 }
 
 export class ActiveTurn {
@@ -309,17 +390,27 @@ export class ActiveTurn {
   private pacedTimer?: ReturnType<typeof setTimeout>
   private pausedForPending = false
   private contextUsed?: number
+  private lastStepContextUsed: number
+  private emittedIntermediateInput = 0
+  private emittedIntermediateCacheRead = 0
   private readonly completedTextBlocks: string[] = []
+  private readonly stepCompletedTextBlocks: string[] = []
   private currentTextBuffer = ""
   promptSettled = false
   abortedOnApiError = false
   promptResult?: AcpPromptResult
   promptError?: Error
 
-  constructor(private readonly callbacks: TurnCallbacks) {}
+  constructor(private readonly callbacks: TurnCallbacks) {
+    this.lastStepContextUsed = callbacks.initialContextUsed ?? 0
+  }
 
   get hasController(): boolean {
     return this.controller !== undefined
+  }
+
+  get latestContextUsed(): number | undefined {
+    return this.contextUsed
   }
 
   get activeNativeToolNames(): readonly string[] {
@@ -330,6 +421,16 @@ export class ActiveTurn {
     return this.currentTextBuffer.trim().length > 0
       ? [...this.completedTextBlocks, this.currentTextBuffer]
       : [...this.completedTextBlocks]
+  }
+
+  get stepAssistantTextBlocks(): readonly string[] {
+    return this.currentTextBuffer.trim().length > 0
+      ? [...this.stepCompletedTextBlocks, this.currentTextBuffer]
+      : [...this.stepCompletedTextBlocks]
+  }
+
+  resetStepTextBlocks(): void {
+    this.stepCompletedTextBlocks.length = 0
   }
 
   private syncWatchdogPause(): void {
@@ -506,9 +607,16 @@ export class ActiveTurn {
         readonly isError: boolean
       }
     >,
+    queuedUserMessage?: string,
   ): void {
     this.drainBufferedParts()
-    for (const callId of [...this.dispatchedCallIds]) {
+    const dispatched = [...this.dispatchedCallIds]
+    const lastResolvableIdx = dispatched.reduce((last, id, idx) => {
+      const p = this.pendingMcpCalls.get(id)
+      return p && !p.resolved ? idx : last
+    }, -1)
+    for (let idx = 0; idx < dispatched.length; idx++) {
+      const callId = dispatched[idx]!
       this.dispatchedCallIds.delete(callId)
       const pending = this.pendingMcpCalls.get(callId)
       if (!pending) continue
@@ -523,11 +631,15 @@ export class ActiveTurn {
           text: `Tool result missing for ${callId}`,
           isError: true,
         }
+        const baseContent: McpContentItem[] =
+          res.content && res.content.length > 0
+            ? [...res.content]
+            : [{ type: "text", text: res.text }]
+        if (queuedUserMessage && idx === lastResolvableIdx) {
+          baseContent.push({ type: "text", text: queuedUserMessage })
+        }
         pending.resolve({
-          content:
-            res.content && res.content.length > 0
-              ? res.content
-              : [{ type: "text", text: res.text }],
+          content: baseContent,
           isError: res.isError,
         })
       } else {
@@ -715,10 +827,17 @@ export class ActiveTurn {
       unified: "tool-calls",
       raw: "tool_calls",
     }
+    let stepUsage = buildUsage()
+    if (this.contextUsed !== undefined && this.contextUsed > 0) {
+      stepUsage = buildStepUsage(this.contextUsed, this.lastStepContextUsed)
+      this.lastStepContextUsed = this.contextUsed
+      this.emittedIntermediateInput += stepUsage.inputTokens.total ?? 0
+      this.emittedIntermediateCacheRead += stepUsage.inputTokens.cacheRead ?? 0
+    }
     this.emitPart({
       type: "finish",
       finishReason,
-      usage: buildUsage(),
+      usage: stepUsage,
       providerMetadata: { [PROVIDER_ID]: { acp: true } },
     })
     const ctrl = this.detachController()
@@ -759,7 +878,12 @@ export class ActiveTurn {
     const kind = update.sessionUpdate
 
     if (kind === "usage_update") {
-      if (typeof update.used === "number" && Number.isFinite(update.used) && update.used >= 0) {
+      if (
+        typeof update.used === "number" &&
+        Number.isFinite(update.used) &&
+        update.used >= 0 &&
+        (update.used > 0 || this.contextUsed === undefined)
+      ) {
         this.contextUsed = update.used
       }
       return
@@ -913,7 +1037,12 @@ export class ActiveTurn {
     this.emitPart({
       type: "finish",
       finishReason: { unified: "stop", raw: rawFinish },
-      usage: buildUsage(this.promptResult?.usage, this.contextUsed),
+      usage: buildFinalTurnUsage({
+        raw: this.promptResult?.usage,
+        activeContextUsed: this.contextUsed,
+        emittedIntermediateInput: this.emittedIntermediateInput,
+        emittedIntermediateCacheRead: this.emittedIntermediateCacheRead,
+      }),
       ...meta,
     })
 
@@ -935,7 +1064,12 @@ export class ActiveTurn {
     this.emitPart({
       type: "finish",
       finishReason: { unified, raw: stopReason ?? "end_turn" },
-      usage: buildUsage(this.promptResult?.usage, this.contextUsed),
+      usage: buildFinalTurnUsage({
+        raw: this.promptResult?.usage,
+        activeContextUsed: this.contextUsed,
+        emittedIntermediateInput: this.emittedIntermediateInput,
+        emittedIntermediateCacheRead: this.emittedIntermediateCacheRead,
+      }),
       providerMetadata: { [PROVIDER_ID]: { acp: true } },
     })
 
@@ -979,6 +1113,7 @@ export class ActiveTurn {
   private closeOpenText(): void {
     if (this.currentTextBuffer.trim().length > 0) {
       this.completedTextBlocks.push(this.currentTextBuffer)
+      this.stepCompletedTextBlocks.push(this.currentTextBuffer)
     }
     this.currentTextBuffer = ""
     if (this.openTextId) {

@@ -64,7 +64,7 @@ export const DEFAULT_SETTINGS: AgySettings = {
   prewarm: "auto",
   smoothStreaming: true,
   maxSystemPromptChars: 120_000,
-  maxMcpResultChars: 8_000,
+  maxMcpResultChars: 9_800,
   extraRelayedTools: [],
   blockedRelayedTools: [],
   includeDefaultCustomizations: false,

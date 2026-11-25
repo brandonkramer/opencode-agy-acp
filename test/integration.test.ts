@@ -5,7 +5,7 @@ import path from "node:path"
 import type { LanguageModelV3Prompt, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { Effect } from "effect"
-import { SessionRegistry } from "../src/acp/sessions.js"
+import { SessionRegistry, resetSharedCatalogCacheForTests } from "../src/acp/sessions.js"
 import { createAgyLanguageModel } from "../src/language-model.js"
 import plugin from "../src/index.js"
 import {
@@ -1097,6 +1097,189 @@ describe("SessionRegistry + fake-agy integration", () => {
       if (prevArgs === undefined) delete process.env.FAKE_AGY_ARGS_LOG
       else process.env.FAKE_AGY_ARGS_LOG = prevArgs
       await reg1.disposeAll()
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test("19. Multi-step turn reports per-step usage, delivers mid-turn queued user messages in-band, and avoids next-turn divergence", async () => {
+    const { ctx } = createMockContext()
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({ codeMode: true, maxMcpResultChars: 500 }),
+    })
+    try {
+      registry.updateContextSnapshot("ses_mid_1", {
+        agent: "build",
+        tools: {
+          execute: { description: "Code mode JS", input: { type: "object", properties: {} } },
+        },
+      })
+
+      const lm = createAgyLanguageModel("gemini-4-neon", registry)
+      const u1 = {
+        role: "user" as const,
+        content: [{ type: "text" as const, text: "[SCENARIO:MULTI_STEP_USAGE_AND_QUEUED]" }],
+      }
+      const { stream: s1 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_mid_1" },
+        prompt: [u1],
+      })
+      const parts1 = await readStreamParts(s1)
+      const tc1 = parts1.find((p) => p.type === "tool-call" && p.toolName === "execute")
+      const fin1 = parts1.find((p) => p.type === "finish")
+      expect(tc1?.type).toBe("tool-call")
+      expect(fin1?.type === "finish" && fin1.usage.inputTokens.total).toBe(10_000)
+      if (tc1?.type !== "tool-call") return
+
+      const acpSid1 = registry.getState("ses_mid_1").acpSessionId
+      expect(acpSid1).toBeTruthy()
+
+      // Mid-turn queued user message arrives while execute #1 is running, and execute #1 returns > maxMcpResultChars
+      const uMid = {
+        role: "user" as const,
+        content: [{ type: "text" as const, text: "Queued follow-up request #1" }],
+      }
+      const bigToolOut =
+        `{"items":"${"X".repeat(900)}"}\n[showing lines 1-1 of 1; full output saved to /tmp/fake-oc-tool-out]`
+      const promptAfterStep1: LanguageModelV3Prompt = [
+        u1,
+        {
+          role: "assistant",
+          content: [{ type: "tool-call", toolCallId: tc1.toolCallId, toolName: "execute", input: {} }],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: tc1.toolCallId,
+              toolName: "execute",
+              output: { type: "text", value: bigToolOut },
+            },
+          ],
+        },
+        uMid,
+      ]
+
+      const { stream: s2 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_mid_1" },
+        prompt: promptAfterStep1,
+      })
+      const parts2 = await readStreamParts(s2)
+      const tc2 = parts2.find((p) => p.type === "tool-call" && p.toolName === "execute")
+      const fin2 = parts2.find((p) => p.type === "finish")
+      expect(tc2?.type).toBe("tool-call")
+      expect(fin2?.type === "finish" && fin2.usage.inputTokens).toEqual({
+        total: 11_200,
+        noCache: 1_200,
+        cacheRead: 10_000,
+        cacheWrite: 0,
+      })
+      if (tc2?.type !== "tool-call") return
+
+      const promptAfterStep2: LanguageModelV3Prompt = [
+        ...promptAfterStep1,
+        {
+          role: "assistant",
+          content: [{ type: "tool-call", toolCallId: tc2.toolCallId, toolName: "execute", input: {} }],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: tc2.toolCallId,
+              toolName: "execute",
+              output: { type: "text", value: "step2-ok" },
+            },
+          ],
+        },
+      ]
+      const { stream: s3 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_mid_1" },
+        prompt: promptAfterStep2,
+      })
+      const parts3 = await readStreamParts(s3)
+      const finalText = textFromParts(parts3)
+      const fin3 = parts3.find((p) => p.type === "finish")
+
+      // Final step usage is normalized to 12500 real window (12000 input + 500 output), NOT cumulative 33700!
+      expect(fin3?.type === "finish").toBe(true)
+      if (fin3?.type === "finish") {
+        expect((fin3.usage.inputTokens.total ?? 0) + (fin3.usage.outputTokens.total ?? 0)).toBe(12_500)
+      }
+
+      // agy received BOTH compacted tool output (with saved pointer preserved) AND intact <queued-user-message>
+      const payload = JSON.parse(finalText.replace("MULTI_OK:", "")) as {
+        sessionId: string
+        r1Texts: string[]
+        r2Texts: string[]
+      }
+      expect(payload.r1Texts).toHaveLength(2)
+      expect(payload.r1Texts[0]).toContain("/tmp/fake-oc-tool-out")
+      expect(payload.r1Texts[1]).toContain("<queued-user-message>")
+      expect(payload.r1Texts[1]).toContain("Queued follow-up request #1")
+      expect(payload.r2Texts).toEqual(["step2-ok"])
+
+      // Turn 2 must stay on the SAME ACP session (no diverged reset / no restore checkpoint!)
+      const { stream: nextTurn } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_mid_1" },
+        prompt: [
+          ...promptAfterStep2,
+          { role: "assistant", content: [{ type: "text", text: finalText }] },
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:ECHO_HANDOFF]" }] },
+        ],
+      })
+      const nextText = textFromParts(await readStreamParts(nextTurn))
+      expect(registry.getState("ses_mid_1").acpSessionId).toBe(acpSid1)
+      expect(nextText).not.toContain("<conversation-checkpoint")
+    } finally {
+      await registry.disposeAll()
+    }
+  })
+
+  test("20. Shares model catalog refresh across concurrent SessionRegistry instances without spawning duplicate agy processes", async () => {
+    resetSharedCatalogCacheForTests()
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-catalog-dedupe-"))
+    const argsLog = path.join(tmp, "args.log")
+    const prevArgs = process.env.FAKE_AGY_ARGS_LOG
+    process.env.FAKE_AGY_ARGS_LOG = argsLog
+
+    const regs = [1, 2, 3].map((n) => {
+      const dir = path.join(tmp, `ws-${n}`)
+      fs.mkdirSync(dir, { recursive: true })
+      const { ctx } = createMockContext({ cwd: dir })
+      return new SessionRegistry(ctx, {
+        settings: makeSettings({ codeMode: false, prewarm: false }),
+      })
+    })
+    try {
+      const results = await Promise.all(regs.map((r) => r.refreshModels({ force: false })))
+      for (const res of results) {
+        expect(res.models.length).toBeGreaterThanOrEqual(2)
+      }
+      // All 3 concurrent directories share ONE discovery spawn
+      const spawns = fs.readFileSync(argsLog, "utf8").trim().split("\n").filter(Boolean)
+      expect(spawns).toHaveLength(1)
+
+      // A 4th registry loading immediately after sees fresh shared cache via loadCachedModels()
+      const dir4 = path.join(tmp, "ws-4")
+      fs.mkdirSync(dir4, { recursive: true })
+      const { ctx: ctx4 } = createMockContext({ cwd: dir4 })
+      const reg4 = new SessionRegistry(ctx4, {
+        settings: makeSettings({ codeMode: false, prewarm: false }),
+      })
+      try {
+        const status = await reg4.loadCachedModels()
+        expect(status.stale).toBe(false)
+        expect(reg4.getModels().length).toBeGreaterThanOrEqual(2)
+      } finally {
+        await reg4.disposeAll()
+      }
+    } finally {
+      resetSharedCatalogCacheForTests()
+      if (prevArgs === undefined) delete process.env.FAKE_AGY_ARGS_LOG
+      else process.env.FAKE_AGY_ARGS_LOG = prevArgs
+      await Promise.all(regs.map((r) => r.disposeAll()))
       fs.rmSync(tmp, { recursive: true, force: true })
     }
   })

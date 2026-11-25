@@ -3,9 +3,12 @@ import type { LanguageModelV3Prompt } from "@ai-sdk/provider"
 import {
   buildCheckpointPromptBlocks,
   buildSavedHistory,
+  buildSavedHistoryFromGroups,
   buildSideCallPromptBlocks,
   decideSync,
+  extractNewMidTurnUserMessages,
   fingerprintGroups,
+  formatMidTurnUserMessages,
   hashAssistantTextBlocks,
   parsePersistedRecord,
 } from "../src/acp/sync.js"
@@ -221,5 +224,59 @@ describe("turn fingerprinting and delta sync", () => {
         hasLiveOrResumableAcpSession: true,
       }),
     ).toEqual({ kind: "continue", matchedCount: 1 })
+  })
+
+  test("extracts mid-turn queued user messages and persists multi-group turn without causing divergence", () => {
+    const u1: LanguageModelV3Prompt[number] = { role: "user", content: [{ type: "text", text: "is it progressing?" }] }
+    const uMid: LanguageModelV3Prompt[number] = {
+      role: "user",
+      content: [{ type: "text", text: "Queued follow-up message 1" }],
+    }
+    const uNext: LanguageModelV3Prompt[number] = {
+      role: "user",
+      content: [{ type: "text", text: "Next turn message" }],
+    }
+
+    const startGroups = fingerprintGroups([u1])
+    const midResumePrompt: LanguageModelV3Prompt = [
+      u1,
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "oc_1", toolName: "execute", input: {} }],
+      },
+      {
+        role: "tool",
+        content: [{ type: "tool-result", toolCallId: "oc_1", toolName: "execute", output: { type: "text", value: "ok" } }],
+      },
+      uMid,
+    ]
+    const midGroups = fingerprintGroups(midResumePrompt)
+    const added = extractNewMidTurnUserMessages(startGroups, midGroups)
+    expect(added).toHaveLength(1)
+    const formatted = formatMidTurnUserMessages(added)
+    expect(formatted).toContain("<queued-user-message>")
+    expect(formatted).toContain("Queued follow-up message 1")
+
+    // Final persistence uses midGroups + text streamed after the mid-turn resume
+    const savedTurns = buildSavedHistoryFromGroups({
+      groups: midGroups,
+      trailingAssistantTextBlocks: ["Handled both progress check and the queued message."],
+    })
+    expect(savedTurns).toHaveLength(2)
+
+    // Next turn arrives with full history -> decideSync MUST return "continue", not "diverged"
+    const nextPrompt: LanguageModelV3Prompt = [
+      ...midResumePrompt,
+      { role: "assistant", content: [{ type: "text", text: "Handled both progress check and the queued message." }] },
+      uNext,
+    ]
+    const nextGroups = fingerprintGroups(nextPrompt)
+    expect(
+      decideSync({
+        recorded: { version: 1, acpSessionId: "acp_live", turns: savedTurns },
+        priorGroups: nextGroups.slice(0, -1),
+        hasLiveOrResumableAcpSession: true,
+      }),
+    ).toEqual({ kind: "continue", matchedCount: 2 })
   })
 })

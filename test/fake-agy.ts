@@ -178,6 +178,44 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     return
   }
 
+  if (text.includes("[SCENARIO:MULTI_STEP_USAGE_AND_QUEUED]")) {
+    sendUpdate(sessionId, { sessionUpdate: "usage_update", used: 10_000, size: 1_048_576 })
+    const r1 = (await callMcpTool(sessionId, "execute", { code: "step1()" })) as {
+      content?: Array<{ text?: string }>
+    }
+    sendUpdate(sessionId, { sessionUpdate: "usage_update", used: 11_200, size: 1_048_576 })
+    const r2 = (await callMcpTool(sessionId, "execute", { code: "step2()" })) as {
+      content?: Array<{ text?: string }>
+    }
+    sendUpdate(sessionId, { sessionUpdate: "usage_update", used: 12_500, size: 1_048_576 })
+    const r1Texts = (r1?.content ?? []).map((c) => c.text ?? "")
+    const r2Texts = (r2?.content ?? []).map((c) => c.text ?? "")
+    sendUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: `MULTI_OK:${JSON.stringify({ sessionId, r1Texts, r2Texts })}`,
+      },
+    })
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        stopReason: "end_turn",
+        // Cumulative sum across 3 steps: 10000 + 11200 + 12500 = 33700
+        usage: {
+          inputTokens: 15_000,
+          cachedReadTokens: 18_200,
+          cachedWriteTokens: 0,
+          outputTokens: 500,
+          thoughtTokens: 100,
+          totalTokens: 33_700,
+        },
+      },
+    })
+    return
+  }
+
   if (text.includes("[SCENARIO:MCP_IMAGE_TOOL]")) {
     const res = await callMcpTool(sessionId, "execute", { code: "screenshot()" })
     sendUpdate(sessionId, {

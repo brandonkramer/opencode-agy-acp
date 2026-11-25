@@ -6,7 +6,7 @@ import path from "node:path"
 import { NATIVE_SHADOWED_TOOLS, PROVIDER_ID, isRecord } from "../types.js"
 import { isFullCodeModeExecuteDescription, rewriteCodeModeExecuteRefs } from "./instructions.js"
 
-const DEFAULT_MAX_MCP_RESULT_CHARS = 8_000
+const DEFAULT_MAX_MCP_RESULT_CHARS = 9_800
 const SPILL_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const SPILL_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 let lastSpillPruneAt = 0
@@ -191,7 +191,7 @@ function enrichMcpToolDescription(toolName: string, rawDescription: string): str
     const normalizedBase = rewriteCodeModeExecuteRefs(base)
     if (isFullCodeModeExecuteDescription(base)) {
       return [
-        "PRIMARY TOOL (OpenCode Full Code Mode): PREFER `mcp_oc_execute` over native `read_file`, `write_file`, `edit_file`, `grep_search`, `find_by_name`, and `run_command` for creating, reading, searching, or editing files (especially multiple files), running shell commands, OpenCode MCP tools, and `tools.opencode.*`. Batch independent operations in ONE script with `Promise.all`, prefer `Bun.file`/`Bun.Glob`/`Bun.write` over `tools.shell` for file ops, return concise filtered summaries (< 4-6 KB), and never `JSON.parse()` large `tools.shell` stdout (> 8 KB may be compacted — filter in shell or write to a temp file and read with `Bun.file().json()`).",
+        "PRIMARY TOOL (OpenCode Full Code Mode): PREFER `mcp_oc_execute` over native `read_file`, `write_file`, `edit_file`, `grep_search`, `find_by_name`, and `run_command` for creating, reading, searching, or editing files (especially multiple files), running shell commands, OpenCode MCP tools, and `tools.opencode.*`. Batch independent operations in ONE script with `Promise.all`, prefer `Bun.file`/`Bun.Glob`/`Bun.write` over `tools.shell` for `ls`/`cat`/`find`/`grep`, parse & project CLI/JSON outputs inside JS instead of returning raw `.output` strings (avoid double-JSON-encoding), return concise filtered summaries (< 4-6 KB) to avoid follow-up file reads, and never `JSON.parse()` truncated `.system_generated/steps/*/output.txt`.",
         "",
         normalizedBase,
         "",

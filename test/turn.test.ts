@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
-import { ActiveTurn, buildUsage, formatNativeToolResult, takeSmoothSlice } from "../src/acp/turn.js"
+import {
+  ActiveTurn,
+  buildFinalTurnUsage,
+  buildStepUsage,
+  buildUsage,
+  formatNativeToolResult,
+  takeSmoothSlice,
+} from "../src/acp/turn.js"
 
 function makeTurn(overrides?: {
   readonly smoothStreaming?: boolean
@@ -251,6 +258,70 @@ describe("smooth streaming pacer (src/acp/turn.ts)", () => {
       totalTokens: 10_529,
     })
     expect(inclusive.inputTokens).toEqual({
+      total: 10_504,
+      noCache: 2_146,
+      cacheRead: 8_358,
+      cacheWrite: undefined,
+    })
+  })
+
+  test("buildStepUsage and buildFinalTurnUsage normalize multi-step cumulative agy usage to actual context window", () => {
+    // Reproduces live 4-step agy probe: steps 10021, 10760, 11751, 13022; cumulative total = 45554
+    const s1 = buildStepUsage(10_021, 0)
+    const s2 = buildStepUsage(10_760, 10_021)
+    const s3 = buildStepUsage(11_751, 10_760)
+    expect(s1.inputTokens).toEqual({ total: 10_021, noCache: 10_021, cacheRead: 0, cacheWrite: 0 })
+    expect(s2.inputTokens).toEqual({ total: 10_760, noCache: 739, cacheRead: 10_021, cacheWrite: 0 })
+    expect(s3.inputTokens).toEqual({ total: 11_751, noCache: 991, cacheRead: 10_760, cacheWrite: 0 })
+
+    const emittedInput = (s1.inputTokens.total ?? 0) + (s2.inputTokens.total ?? 0) + (s3.inputTokens.total ?? 0)
+    const emittedCr = (s1.inputTokens.cacheRead ?? 0) + (s2.inputTokens.cacheRead ?? 0) + (s3.inputTokens.cacheRead ?? 0)
+
+    const finalStep = buildFinalTurnUsage({
+      raw: {
+        inputTokens: 18_604,
+        cachedReadTokens: 26_395,
+        cachedWriteTokens: 0,
+        outputTokens: 555,
+        thoughtTokens: 0,
+        totalTokens: 45_554,
+      },
+      activeContextUsed: 13_022,
+      emittedIntermediateInput: emittedInput,
+      emittedIntermediateCacheRead: emittedCr,
+    })
+    // Final assistant message matches true single-step context occupancy (12467 + 555 = 13022), NOT 45554
+    expect((finalStep.inputTokens.total ?? 0) + (finalStep.outputTokens.total ?? 0)).toBe(13_022)
+    // Cumulative totals across steps 1..4 reconcile exactly to agy's result.usage
+    expect(emittedCr + (finalStep.inputTokens.cacheRead ?? 0)).toBe(26_395)
+    expect(
+      (s1.inputTokens.noCache ?? 0) +
+        (s2.inputTokens.noCache ?? 0) +
+        (s3.inputTokens.noCache ?? 0) +
+        (finalStep.inputTokens.noCache ?? 0),
+    ).toBe(18_604)
+
+    // Native-tool-only multi-step turn (0 intermediate MCP flushes, cumulative 844K vs 81.5K real window)
+    const nativeMulti = buildFinalTurnUsage({
+      raw: {
+        inputTokens: 82_728,
+        cachedReadTokens: 761_744,
+        cachedWriteTokens: 0,
+        outputTokens: 16_869,
+        thoughtTokens: 7_538,
+        totalTokens: 861_341,
+      },
+      activeContextUsed: 81_508,
+    })
+    expect((nativeMulti.inputTokens.total ?? 0) + (nativeMulti.outputTokens.total ?? 0)).toBe(81_508)
+    expect(nativeMulti.inputTokens.cacheRead).toBeGreaterThan(50_000)
+
+    // Single-step turn (inputTotal <= contextUsed) passes through verbatim
+    const singleStep = buildFinalTurnUsage({
+      raw: { inputTokens: 2_146, cachedReadTokens: 8_358, outputTokens: 25, totalTokens: 10_529 },
+      activeContextUsed: 10_529,
+    })
+    expect(singleStep.inputTokens).toEqual({
       total: 10_504,
       noCache: 2_146,
       cacheRead: 8_358,
