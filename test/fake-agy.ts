@@ -138,6 +138,75 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     return
   }
 
+  if (text.includes("[SCENARIO:NATIVE_BG_WATCHER]")) {
+    sendUpdate(sessionId, {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc_bg_1",
+      name: "run_command",
+      status: "in_progress",
+      rawInput: { CommandLine: "gh run watch", WaitMsBeforeAsync: 500 },
+    })
+    sendUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "Waiting on background command... " },
+    })
+    sendUpdate(sessionId, {
+      sessionUpdate: "usage_update",
+      used: 50_000,
+      size: 1_048_576,
+    })
+    // Silent past short chunkTimeoutMs while native tool is still running
+    await Bun.sleep(220)
+    sendUpdate(sessionId, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc_bg_1",
+      status: "completed",
+      rawOutput: { output: "CI passed", exit_code: 0 },
+    })
+    sendUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "NATIVE_BG_OK" },
+    })
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: { stopReason: "end_turn", usage: { inputTokens: 100, outputTokens: 20 } },
+    })
+    return
+  }
+
+  if (text.includes("[SCENARIO:NATIVE_BG_THEN_LLM_STALL]")) {
+    sendUpdate(sessionId, {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc_bg_then_stall",
+      name: "run_command",
+      status: "in_progress",
+      rawInput: { CommandLine: "build" },
+    })
+    // Survives past chunkTimeoutMs while native tool runs...
+    await Bun.sleep(160)
+    sendUpdate(sessionId, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc_bg_then_stall",
+      status: "completed",
+      rawOutput: { output: "ok", exit_code: 0 },
+    })
+    // ...then hangs silently with no active native tools, so normal chunkTimeoutMs should fire!
+    return
+  }
+
+  if (text.includes("[SCENARIO:NATIVE_TOOL_STALL]")) {
+    sendUpdate(sessionId, {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc_native_wedged",
+      name: "run_command",
+      status: "in_progress",
+      rawInput: { CommandLine: "sleep forever" },
+    })
+    // Never completes — nativeToolTimeoutMs safety cap must still fire
+    return
+  }
+
   if (text.includes("[SCENARIO:SLOW_CHUNKS]")) {
     for (const part of ["one ", "two ", "three"]) {
       await Bun.sleep(50)

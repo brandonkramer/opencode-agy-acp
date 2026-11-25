@@ -232,7 +232,7 @@ interface PendingRpc {
 interface ActiveWatchdog {
   readonly id: number
   readonly idleMs: number
-  readonly onStall: () => void
+  readonly onStall: (effectiveIdleMs: number) => void
   timer?: ReturnType<typeof setTimeout>
 }
 
@@ -250,6 +250,7 @@ export class AcpProcess {
   private exitNotified = false
   private watchdog?: ActiveWatchdog
   private watchdogPauseDepth = 0
+  private watchdogIdleOverrideMs?: number
   private handlers: AcpProcessHandlers
   private readonly sessionUpdateHandlers = new Map<string, (update: AcpSessionUpdate) => void>()
 
@@ -405,17 +406,37 @@ export class AcpProcess {
     }
   }
 
+  setWatchdogIdleOverride(idleMs: number | undefined): void {
+    const normalized =
+      typeof idleMs === "number" && Number.isFinite(idleMs) && idleMs > 0
+        ? Math.floor(idleMs)
+        : undefined
+    if (this.watchdogIdleOverrideMs === normalized) return
+    this.watchdogIdleOverrideMs = normalized
+    if (this.watchdog && this.watchdogPauseDepth === 0) {
+      this.armWatchdogTimer(this.watchdog)
+    }
+  }
+
+  private effectiveWatchdogIdleMs(dog: ActiveWatchdog): number {
+    if (this.watchdogIdleOverrideMs !== undefined) {
+      return Math.max(dog.idleMs, this.watchdogIdleOverrideMs)
+    }
+    return dog.idleMs
+  }
+
   private armWatchdogTimer(dog: ActiveWatchdog): void {
     if (dog.timer) clearTimeout(dog.timer)
-    if (this.watchdogPauseDepth > 0 || dog.idleMs <= 0 || this.closed) {
+    const effectiveMs = this.effectiveWatchdogIdleMs(dog)
+    if (this.watchdogPauseDepth > 0 || effectiveMs <= 0 || this.closed) {
       dog.timer = undefined
       return
     }
     dog.timer = setTimeout(() => {
       if (this.watchdog !== dog || this.watchdogPauseDepth > 0 || this.closed) return
-      this.recordTrace("sys", `watchdog expired after ${dog.idleMs}ms of ACP silence`)
-      dog.onStall()
-    }, dog.idleMs)
+      this.recordTrace("sys", `watchdog expired after ${effectiveMs}ms of ACP silence`)
+      dog.onStall(effectiveMs)
+    }, effectiveMs)
     dog.timer.unref?.()
   }
 
@@ -429,6 +450,7 @@ export class AcpProcess {
     if (id !== undefined && this.watchdog.id !== id) return
     if (this.watchdog.timer) clearTimeout(this.watchdog.timer)
     this.watchdog = undefined
+    this.watchdogIdleOverrideMs = undefined
   }
 
   private recordTrace(dir: WireTraceEntry["dir"], summary: string): void {
@@ -728,8 +750,8 @@ export class AcpProcess {
         const dog: ActiveWatchdog = {
           id,
           idleMs: idleWatchdogMs,
-          onStall: () => {
-            this.failPending(id, new AcpStallError(idleWatchdogMs, this.getRecentTrace()))
+          onStall: (effectiveMs) => {
+            this.failPending(id, new AcpStallError(effectiveMs, this.getRecentTrace()))
           },
         }
         this.watchdog = dog

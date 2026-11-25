@@ -4,7 +4,7 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
 
 ## Features
 
-1. **Stream-idle watchdog (`chunkTimeoutMs`, default 120s):** Rejects wedged `session/prompt` calls with `AcpStallError` + the last 8 wire-trace entries, cancels and kills the hung process group, and resets the session cleanly instead of hanging forever. Automatically pauses while OpenCode runs relayed tools, `question`, or permission prompts.
+1. **Stream-idle watchdog (`chunkTimeoutMs`, default 120s):** Rejects wedged `session/prompt` calls with `AcpStallError` + the last 8 wire-trace entries, cancels and kills the hung process group, and resets the session cleanly instead of hanging forever. Automatically pauses while OpenCode runs relayed tools, `question`, or permission prompts, and extends to `nativeToolTimeoutMs` (default 15m) while native `agy` tools are in-flight.
 2. **Deadlock-free tool & elicitation handling:**
    - **Hybrid Auto Code Mode by default (`codeMode: "auto"`):** Keeps native `agy` tools fast for local edits/shell (`NATIVE_SHADOWED_TOOLS`) while automatically relaying OpenCode's non-shadowed tools (`execute`, `subagent`, MCP servers) without `--process-per-session` overhead. Supports `extraRelayedTools` / `blockedRelayedTools` overrides or forcing `true` / `false`.
    - **`mcp_oc_execute` & rich media bridging:** Guides `agy` from OpenCode's `execute` docs directly to `mcp_oc_execute`, streams image/file attachments from OpenCode tool results over MCP, and avoids false deadlocks on `activeNativeTools` (`nativeFlushGraceMs`, default 400ms).
@@ -36,6 +36,7 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
         "isolateUserMcp": true,
         "maxMcpResultChars": 9800,
         "chunkTimeoutMs": 120000,
+        "nativeToolTimeoutMs": 900000,
         "permissionTimeoutMs": 300000,
         "idleTimeoutMs": 300000
       }
@@ -80,6 +81,7 @@ No extra plugin configuration is needed — `codeMode: "auto"` automatically rel
 - `AGY_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS=true|false`
 - `AGY_ACP_ISOLATE_USER_MCP=true|false`
 - `AGY_ACP_CHUNK_TIMEOUT_MS`
+- `AGY_ACP_NATIVE_TOOL_TIMEOUT_MS`
 - `AGY_ACP_TRACE_LOG=/path/to/trace.jsonl`
 
 ## Development

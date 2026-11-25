@@ -49,6 +49,7 @@ export interface AgySettings {
   readonly isolateUserMcp: boolean
   readonly startupTimeoutMs: number
   readonly chunkTimeoutMs: number
+  readonly nativeToolTimeoutMs: number
   readonly settleTimeoutMs: number
   readonly permissionTimeoutMs: number
   readonly nativeFlushGraceMs: number
@@ -71,6 +72,7 @@ export const DEFAULT_SETTINGS: AgySettings = {
   isolateUserMcp: true,
   startupTimeoutMs: 30_000,
   chunkTimeoutMs: 120_000,
+  nativeToolTimeoutMs: 15 * 60_000,
   settleTimeoutMs: 3_000,
   permissionTimeoutMs: 300_000,
   nativeFlushGraceMs: 400,
@@ -208,6 +210,10 @@ export function resolveSettings(
       readPositiveInt(rawSettings.chunkTimeoutMs) ??
       readPositiveInt(env.AGY_ACP_CHUNK_TIMEOUT_MS) ??
       base.chunkTimeoutMs,
+    nativeToolTimeoutMs:
+      readPositiveInt(rawSettings.nativeToolTimeoutMs) ??
+      readPositiveInt(env.AGY_ACP_NATIVE_TOOL_TIMEOUT_MS) ??
+      base.nativeToolTimeoutMs,
     settleTimeoutMs:
       readPositiveInt(rawSettings.settleTimeoutMs) ??
       readPositiveInt(env.AGY_ACP_SETTLE_TIMEOUT_MS) ??

@@ -5,6 +5,7 @@ import {
   buildFinalTurnUsage,
   buildStepUsage,
   buildUsage,
+  extractNativeToolTimeoutMs,
   formatNativeToolResult,
   takeSmoothSlice,
 } from "../src/acp/turn.js"
@@ -327,5 +328,54 @@ describe("smooth streaming pacer (src/acp/turn.ts)", () => {
       cacheRead: 8_358,
       cacheWrite: undefined,
     })
+  })
+
+  test("extractNativeToolTimeoutMs and ActiveTurn watchdog override track in-flight native tools", () => {
+    expect(extractNativeToolTimeoutMs({}, 900_000)).toBe(900_000)
+    expect(extractNativeToolTimeoutMs({ NotificationTimeoutSeconds: 600 }, 900_000)).toBe(900_000)
+    expect(extractNativeToolTimeoutMs({ NotificationTimeoutSeconds: 1200 }, 900_000)).toBe(1_320_000)
+    expect(extractNativeToolTimeoutMs({ DurationSeconds: 10_000 }, 900_000)).toBe(3_600_000)
+
+    const overrides: Array<number | undefined> = []
+    const turn = new ActiveTurn({
+      pauseWatchdog: () => {},
+      resumeWatchdog: () => {},
+      setWatchdogIdleOverride: (ms) => overrides.push(ms),
+      nativeToolTimeoutMs: 900_000,
+      onApiErrorText: () => {},
+      onInterruptRequested: () => {},
+      onTurnSettled: () => {},
+      getKnownRelayedNames: () => new Set(),
+      nativeFlushGraceMs: 100,
+    })
+
+    turn.handleUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "tc_1",
+      name: "run_command",
+      status: "in_progress",
+      rawInput: { CommandLine: "watch ci" },
+    })
+    turn.handleUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "tc_2",
+      name: "run_command",
+      status: "in_progress",
+      rawInput: { NotificationTimeoutSeconds: 1200 },
+    })
+    turn.handleUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc_2",
+      status: "completed",
+      rawOutput: { output: "done", exit_code: 0 },
+    })
+    turn.handleUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc_1",
+      status: "completed",
+      rawOutput: { output: "done", exit_code: 0 },
+    })
+
+    expect(overrides).toEqual([900_000, 1_320_000, 900_000, undefined])
   })
 })

@@ -1722,6 +1722,8 @@ export class SessionRegistry {
     const turn = new ActiveTurn({
       pauseWatchdog: () => proc.pauseWatchdog(),
       resumeWatchdog: () => proc.resumeWatchdog(),
+      setWatchdogIdleOverride: (idleMs) => proc.setWatchdogIdleOverride(idleMs),
+      nativeToolTimeoutMs: runtimeSettings.nativeToolTimeoutMs,
       nativeFlushGraceMs: runtimeSettings.nativeFlushGraceMs,
       smoothStreaming: runtimeSettings.smoothStreaming,
       initialContextUsed: entry.lastContextUsed,
@@ -1874,6 +1876,8 @@ export class SessionRegistry {
     const turn = new ActiveTurn({
       pauseWatchdog: () => activeProc.pauseWatchdog(),
       resumeWatchdog: () => activeProc.resumeWatchdog(),
+      setWatchdogIdleOverride: (idleMs) => activeProc.setWatchdogIdleOverride(idleMs),
+      nativeToolTimeoutMs: runtimeSettings.nativeToolTimeoutMs,
       nativeFlushGraceMs: runtimeSettings.nativeFlushGraceMs,
       getKnownRelayedNames: () => new Set<string>(),
       onInterruptRequested: (reason) => {

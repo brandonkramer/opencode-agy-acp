@@ -344,6 +344,33 @@ export function formatNativeToolResult(update: AcpSessionUpdate): NonNullable<JS
   }
 }
 
+const MAX_NATIVE_TOOL_HINT_MS = 60 * 60_000
+const NATIVE_TOOL_HINT_BUFFER_MS = 120_000
+
+export function extractNativeToolTimeoutMs(rawInput: unknown, baseTimeoutMs: number): number {
+  let effective = baseTimeoutMs
+  if (isRecord(rawInput)) {
+    const hintSeconds =
+      typeof rawInput.NotificationTimeoutSeconds === "number"
+        ? rawInput.NotificationTimeoutSeconds
+        : typeof rawInput.notificationTimeoutSeconds === "number"
+          ? rawInput.notificationTimeoutSeconds
+          : typeof rawInput.DurationSeconds === "number"
+            ? rawInput.DurationSeconds
+            : undefined
+    if (typeof hintSeconds === "number" && Number.isFinite(hintSeconds) && hintSeconds > 0) {
+      const hintedMs = Math.min(
+        MAX_NATIVE_TOOL_HINT_MS,
+        Math.floor(hintSeconds * 1000) + NATIVE_TOOL_HINT_BUFFER_MS,
+      )
+      if (hintedMs > effective) {
+        effective = hintedMs
+      }
+    }
+  }
+  return effective
+}
+
 interface PendingMcpCall {
   readonly toolCallId: string
   readonly openCodeToolName: string
@@ -359,6 +386,8 @@ interface PendingMcpCall {
 export interface TurnCallbacks {
   readonly pauseWatchdog: () => void
   readonly resumeWatchdog: () => void
+  readonly setWatchdogIdleOverride?: (idleMs: number | undefined) => void
+  readonly nativeToolTimeoutMs?: number
   readonly onApiErrorText: (text: string) => void
   readonly onInterruptRequested: (reason: string) => void
   readonly onTurnSettled: () => void
@@ -374,6 +403,7 @@ export class ActiveTurn {
   readonly pendingMcpCalls = new Map<string, PendingMcpCall>()
   readonly dispatchedCallIds = new Set<string>()
   private readonly nativeToolText = new Map<string, string>()
+  private readonly nativeToolTimeouts = new Map<string, number>()
   private readonly relayedUpdateIds = new Set<string>()
   private readonly bufferedParts: LanguageModelV3StreamPart[] = []
   private controller?: ReadableStreamDefaultController<LanguageModelV3StreamPart>
@@ -389,6 +419,7 @@ export class ActiveTurn {
   private pacedSliceChars = SMOOTH_TEXT_MIN_SLICE
   private pacedTimer?: ReturnType<typeof setTimeout>
   private pausedForPending = false
+  private activeWatchdogOverrideMs?: number
   private contextUsed?: number
   private lastStepContextUsed: number
   private emittedIntermediateInput = 0
@@ -433,7 +464,24 @@ export class ActiveTurn {
     this.stepCompletedTextBlocks.length = 0
   }
 
+  private desiredNativeWatchdogMs(): number | undefined {
+    if (this.activeNativeTools.size === 0) return undefined
+    const base = this.callbacks.nativeToolTimeoutMs
+    if (!base || base <= 0) return undefined
+    let maxMs = base
+    for (const ms of this.nativeToolTimeouts.values()) {
+      if (ms > maxMs) maxMs = ms
+    }
+    return maxMs
+  }
+
   private syncWatchdogPause(): void {
+    const desiredOverride = this.desiredNativeWatchdogMs()
+    if (desiredOverride !== this.activeWatchdogOverrideMs) {
+      this.activeWatchdogOverrideMs = desiredOverride
+      this.callbacks.setWatchdogIdleOverride?.(desiredOverride)
+    }
+
     const shouldPause = this.pendingMcpCalls.size > 0
     if (shouldPause && !this.pausedForPending) {
       this.pausedForPending = true
@@ -674,6 +722,7 @@ export class ActiveTurn {
       const stripped = nativeName.replace(/^acp_/, "")
       if (stripped === openCodeToolName || stripped.endsWith(`_${openCodeToolName}`)) {
         this.activeNativeTools.delete(nativeId)
+        this.nativeToolTimeouts.delete(nativeId)
         this.relayedUpdateIds.add(nativeId)
       }
     }
@@ -850,7 +899,9 @@ export class ActiveTurn {
     const toolName = this.activeNativeTools.get(toolCallId)
     if (toolName === undefined) return
     this.activeNativeTools.delete(toolCallId)
+    this.nativeToolTimeouts.delete(toolCallId)
     this.relayedUpdateIds.add(toolCallId)
+    this.syncWatchdogPause()
     this.emitPart({
       type: "tool-result",
       toolCallId,
@@ -949,6 +1000,12 @@ export class ActiveTurn {
         displayName = `acp_${name}`
         this.activeNativeTools.set(callId, displayName)
         const rawInput = update.rawInput ?? update.args ?? {}
+        if (!TERMINAL_TOOL_STATUSES.has(status) && this.callbacks.nativeToolTimeoutMs && this.callbacks.nativeToolTimeoutMs > 0) {
+          this.nativeToolTimeouts.set(
+            callId,
+            extractNativeToolTimeoutMs(rawInput, this.callbacks.nativeToolTimeoutMs),
+          )
+        }
         const jsonInput = JSON.stringify(rawInput)
         this.nativeToolText.set(callId, `${name}\n${update.title ?? ""}\n${jsonInput}`)
         this.emitPart({
@@ -974,10 +1031,25 @@ export class ActiveTurn {
           providerExecuted: true,
           providerMetadata: { [PROVIDER_ID]: { acp: true } },
         })
+      } else if (
+        !TERMINAL_TOOL_STATUSES.has(status) &&
+        (update.rawInput !== undefined || update.args !== undefined) &&
+        this.callbacks.nativeToolTimeoutMs &&
+        this.callbacks.nativeToolTimeoutMs > 0
+      ) {
+        const hinted = extractNativeToolTimeoutMs(
+          update.rawInput ?? update.args,
+          this.callbacks.nativeToolTimeoutMs,
+        )
+        const prev = this.nativeToolTimeouts.get(callId) ?? 0
+        if (hinted > prev) {
+          this.nativeToolTimeouts.set(callId, hinted)
+        }
       }
 
       if (TERMINAL_TOOL_STATUSES.has(status)) {
         this.activeNativeTools.delete(callId)
+        this.nativeToolTimeouts.delete(callId)
         const isError = ERROR_TOOL_STATUSES.has(status)
         const resultPayload = formatNativeToolResult(update)
         this.emitPart({
@@ -993,6 +1065,7 @@ export class ActiveTurn {
           this.tryFlush(false)
         }
       }
+      this.syncWatchdogPause()
     }
   }
 
@@ -1081,6 +1154,8 @@ export class ActiveTurn {
 
   finishWithError(error: Error): void {
     this.flushPacedImmediate()
+    this.activeNativeTools.clear()
+    this.nativeToolTimeouts.clear()
     this.cancelPendingCalls(error.message)
     const ctrl = this.detachController()
     if (!ctrl) {
@@ -1108,6 +1183,8 @@ export class ActiveTurn {
       })
     }
     this.activeNativeTools.clear()
+    this.nativeToolTimeouts.clear()
+    this.syncWatchdogPause()
   }
 
   private closeOpenText(): void {

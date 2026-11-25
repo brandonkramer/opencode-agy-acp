@@ -1283,4 +1283,70 @@ describe("SessionRegistry + fake-agy integration", () => {
       fs.rmSync(tmp, { recursive: true, force: true })
     }
   })
+
+  test("21. Native-tool watchdog grace survives slow native commands, resumes chunkTimeoutMs after completion, and enforces nativeToolTimeoutMs cap", async () => {
+    const { ctx } = createMockContext()
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({
+        codeMode: false,
+        chunkTimeoutMs: 100,
+        nativeToolTimeoutMs: 450,
+      }),
+    })
+    try {
+      const lm = createAgyLanguageModel("gemini-4-neon", registry)
+
+      // 1) Native background command silent for 220ms (> 100ms chunkTimeoutMs, < 450ms nativeToolTimeoutMs) succeeds
+      const { stream: okStream } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_native_bg_1" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:NATIVE_BG_WATCHER]" }] }],
+      })
+      const okParts = await readStreamParts(okStream)
+      expect(okParts.some((p) => p.type === "error")).toBe(false)
+      expect(textFromParts(okParts)).toContain("NATIVE_BG_OK")
+      expect(registry.getState("ses_native_bg_1").connected).toBe(true)
+
+      // 2) Once the native tool finishes, LLM silence reverts to chunkTimeoutMs (100ms)
+      const { stream: llmStallStream } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_native_bg_1" },
+        prompt: [
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:NATIVE_BG_THEN_LLM_STALL]" }] },
+        ],
+      })
+      const llmStallParts = await readStreamParts(llmStallStream)
+      const llmErr = llmStallParts.find((p) => p.type === "error")
+      expect(llmErr?.type).toBe("error")
+      if (llmErr?.type === "error") {
+        expect(llmErr.error).toBeInstanceOf(AcpStallError)
+        expect((llmErr.error as AcpStallError).idleMs).toBe(100)
+      }
+
+      // 3) Truly wedged native tool still trips the bounded nativeToolTimeoutMs cap (240ms)
+      const registryCap = new SessionRegistry(ctx, {
+        settings: makeSettings({
+          codeMode: false,
+          chunkTimeoutMs: 80,
+          nativeToolTimeoutMs: 240,
+        }),
+      })
+      try {
+        const lmCap = createAgyLanguageModel("gemini-4-neon", registryCap)
+        const { stream: capStream } = await lmCap.doStream({
+          headers: { "x-opencode-session-id": "ses_native_cap_1" },
+          prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:NATIVE_TOOL_STALL]" }] }],
+        })
+        const capParts = await readStreamParts(capStream)
+        const capErr = capParts.find((p) => p.type === "error")
+        expect(capErr?.type).toBe("error")
+        if (capErr?.type === "error") {
+          expect(capErr.error).toBeInstanceOf(AcpStallError)
+          expect((capErr.error as AcpStallError).idleMs).toBe(240)
+        }
+      } finally {
+        await registryCap.disposeAll()
+      }
+    } finally {
+      await registry.disposeAll()
+    }
+  })
 })
