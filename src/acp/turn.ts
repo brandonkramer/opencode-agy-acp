@@ -402,6 +402,7 @@ export class ActiveTurn {
   readonly activeNativeTools = new Map<string, string>()
   readonly pendingMcpCalls = new Map<string, PendingMcpCall>()
   readonly dispatchedCallIds = new Set<string>()
+  private readonly stepOpenNativeTools = new Map<string, string>()
   private readonly nativeToolText = new Map<string, string>()
   private readonly nativeToolTimeouts = new Map<string, number>()
   private readonly relayedUpdateIds = new Set<string>()
@@ -724,6 +725,20 @@ export class ActiveTurn {
         this.activeNativeTools.delete(nativeId)
         this.nativeToolTimeouts.delete(nativeId)
         this.relayedUpdateIds.add(nativeId)
+        if (this.stepOpenNativeTools.delete(nativeId)) {
+          this.closeOpenBlocks()
+          this.emitPart({
+            type: "tool-result",
+            toolCallId: nativeId,
+            toolName: nativeName,
+            result: {
+              status: "relayed",
+              message: "Relayed to OpenCode tool.",
+            },
+            isError: false,
+            providerMetadata: { [PROVIDER_ID]: { acp: true } },
+          })
+        }
       }
     }
 
@@ -831,7 +846,7 @@ export class ActiveTurn {
       }
     }
 
-    if (this.activeNativeTools.size > 0 && !bypass) {
+    if (this.stepOpenNativeTools.size > 0 && !bypass) {
       this.armGraceFlush()
       return
     }
@@ -842,6 +857,7 @@ export class ActiveTurn {
     if (settleIds.size === 0) {
       this.closeOpenBlocks()
     }
+    this.detachOpenNativeToolsForFlush()
 
     for (const call of unsent) {
       call.emittedToOpenCode = true
@@ -895,6 +911,24 @@ export class ActiveTurn {
     } catch {}
   }
 
+  private detachOpenNativeToolsForFlush(): void {
+    if (this.stepOpenNativeTools.size === 0) return
+    for (const [toolCallId, toolName] of this.stepOpenNativeTools) {
+      this.emitPart({
+        type: "tool-result",
+        toolCallId,
+        toolName,
+        result: {
+          status: "running",
+          message: "Native ACP tool continues running in background.",
+        },
+        isError: false,
+        providerMetadata: { [PROVIDER_ID]: { acp: true } },
+      })
+    }
+    this.stepOpenNativeTools.clear()
+  }
+
   private settleNativeToolForUserInput(toolCallId: string): void {
     const toolName = this.activeNativeTools.get(toolCallId)
     if (toolName === undefined) return
@@ -902,14 +936,16 @@ export class ActiveTurn {
     this.nativeToolTimeouts.delete(toolCallId)
     this.relayedUpdateIds.add(toolCallId)
     this.syncWatchdogPause()
-    this.emitPart({
-      type: "tool-result",
-      toolCallId,
-      toolName,
-      result: { status: "asked", message: "Asked the user with OpenCode's question tool." },
-      isError: false,
-      providerMetadata: { [PROVIDER_ID]: { acp: true } },
-    })
+    if (this.stepOpenNativeTools.delete(toolCallId)) {
+      this.emitPart({
+        type: "tool-result",
+        toolCallId,
+        toolName,
+        result: { status: "asked", message: "Asked the user with OpenCode's question tool." },
+        isError: false,
+        providerMetadata: { [PROVIDER_ID]: { acp: true } },
+      })
+    }
   }
 
   private isRelayedToolName(name: string): boolean {
@@ -999,6 +1035,7 @@ export class ActiveTurn {
         this.closeOpenBlocks()
         displayName = `acp_${name}`
         this.activeNativeTools.set(callId, displayName)
+        this.stepOpenNativeTools.set(callId, displayName)
         const rawInput = update.rawInput ?? update.args ?? {}
         if (!TERMINAL_TOOL_STATUSES.has(status) && this.callbacks.nativeToolTimeoutMs && this.callbacks.nativeToolTimeoutMs > 0) {
           this.nativeToolTimeouts.set(
@@ -1050,16 +1087,18 @@ export class ActiveTurn {
       if (TERMINAL_TOOL_STATUSES.has(status)) {
         this.activeNativeTools.delete(callId)
         this.nativeToolTimeouts.delete(callId)
-        const isError = ERROR_TOOL_STATUSES.has(status)
-        const resultPayload = formatNativeToolResult(update)
-        this.emitPart({
-          type: "tool-result",
-          toolCallId: callId,
-          toolName: displayName,
-          result: resultPayload ?? { status },
-          isError,
-          providerMetadata: { [PROVIDER_ID]: { acp: true } },
-        })
+        if (this.stepOpenNativeTools.delete(callId)) {
+          const isError = ERROR_TOOL_STATUSES.has(status)
+          const resultPayload = formatNativeToolResult(update)
+          this.emitPart({
+            type: "tool-result",
+            toolCallId: callId,
+            toolName: displayName,
+            result: resultPayload ?? { status },
+            isError,
+            providerMetadata: { [PROVIDER_ID]: { acp: true } },
+          })
+        }
 
         if (this.pendingMcpCalls.size > 0) {
           this.tryFlush(false)
@@ -1154,6 +1193,7 @@ export class ActiveTurn {
 
   finishWithError(error: Error): void {
     this.flushPacedImmediate()
+    this.stepOpenNativeTools.clear()
     this.activeNativeTools.clear()
     this.nativeToolTimeouts.clear()
     this.cancelPendingCalls(error.message)
@@ -1169,7 +1209,7 @@ export class ActiveTurn {
   }
 
   private finishUnconfirmedNativeTools(): void {
-    for (const [toolCallId, toolName] of this.activeNativeTools) {
+    for (const [toolCallId, toolName] of this.stepOpenNativeTools) {
       this.emitPart({
         type: "tool-result",
         toolCallId,
@@ -1182,6 +1222,7 @@ export class ActiveTurn {
         providerMetadata: { [PROVIDER_ID]: { acp: true } },
       })
     }
+    this.stepOpenNativeTools.clear()
     this.activeNativeTools.clear()
     this.nativeToolTimeouts.clear()
     this.syncWatchdogPause()

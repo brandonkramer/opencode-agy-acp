@@ -342,6 +342,47 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     return
   }
 
+  if (text.includes("[SCENARIO:BG_NATIVE_ACROSS_MCP_STEPS]")) {
+    // Reproduces long-running native background command that stays open across an MCP flush
+    // and completes during Step 2 (while still keeping watchdog extended until completion).
+    sendUpdate(sessionId, {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc_bg_cross_step",
+      name: "run_command",
+      status: "in_progress",
+      rawInput: { CommandLine: "watch-merge-queue", WaitMsBeforeAsync: 500, NotificationTimeoutSeconds: 900 },
+    })
+    sendUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "Started background watcher. " },
+    })
+    const res = (await callMcpTool(sessionId, "execute", { code: "checkQueue()" })) as {
+      content?: Array<{ text?: string }>
+    }
+    sendUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: `Queue check: ${res?.content?.[0]?.text ?? ""}. ` },
+    })
+    // Silent longer than chunkTimeoutMs in Step 2 while detached native background command still runs
+    await Bun.sleep(180)
+    sendUpdate(sessionId, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc_bg_cross_step",
+      status: "completed",
+      rawOutput: { output: "PR merged", exit_code: 0 },
+    })
+    sendUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "CROSS_STEP_OK" },
+    })
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: { stopReason: "end_turn", usage: { inputTokens: 120, outputTokens: 30 } },
+    })
+    return
+  }
+
   if (text.includes("[SCENARIO:MCP_PAUSE_WATCHDOG]")) {
     const res = (await callMcpTool(sessionId, "subagent", { task: "slow" })) as {
       content?: Array<{ text?: string }>

@@ -89,6 +89,28 @@ function textFromParts(parts: readonly LanguageModelV3StreamPart[]): string {
     .join("")
 }
 
+/**
+ * Mirrors OpenCode SessionStep stream invariants:
+ * - Every `tool-result` must match a `tool-call` emitted in the SAME step stream
+ *   (otherwise OpenCode throws `Error: Tool result before call: <id>`).
+ * - Every `providerExecuted` native `tool-call` must receive a `tool-result` before the
+ *   step stream closes (otherwise OpenCode marks it `tool.result-missing`).
+ */
+function assertStepToolCallInvariant(parts: readonly LanguageModelV3StreamPart[]): void {
+  const seenCalls = new Set<string>()
+  const openProviderExecuted = new Set<string>()
+  for (const part of parts) {
+    if (part.type === "tool-call") {
+      seenCalls.add(part.toolCallId)
+      if (part.providerExecuted) openProviderExecuted.add(part.toolCallId)
+    } else if (part.type === "tool-result") {
+      expect(seenCalls.has(part.toolCallId)).toBe(true)
+      openProviderExecuted.delete(part.toolCallId)
+    }
+  }
+  expect(openProviderExecuted.size).toBe(0)
+}
+
 describe("SessionRegistry + fake-agy integration", () => {
   test("1. Pure ACP turn emits thought, native tool, usage, and omits --process-per-session", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-1-"))
@@ -291,6 +313,7 @@ describe("SessionRegistry + fake-agy integration", () => {
         ],
       })
       const parts1 = await readStreamParts(step1)
+      assertStepToolCallInvariant(parts1)
       const toolCall = parts1.find((p) => p.type === "tool-call" && p.toolName === "subagent")
       expect(toolCall).toBeDefined()
       if (toolCall?.type !== "tool-call") return
@@ -313,6 +336,7 @@ describe("SessionRegistry + fake-agy integration", () => {
         ],
       })
       const parts2 = await readStreamParts(step2)
+      assertStepToolCallInvariant(parts2)
       expect(textFromParts(parts2)).toContain("GRACE_OK:checked")
     } finally {
       await registry.disposeAll()
@@ -1345,6 +1369,73 @@ describe("SessionRegistry + fake-agy integration", () => {
       } finally {
         await registryCap.disposeAll()
       }
+    } finally {
+      await registry.disposeAll()
+    }
+  })
+
+  test("22. Background native tool spanning an MCP flush closes cleanly in Step 1, never leaks orphan tool-result into Step 2, and preserves watchdog grace", async () => {
+    const { ctx } = createMockContext()
+    const registry = new SessionRegistry(ctx, {
+      settings: makeSettings({
+        codeMode: true,
+        nativeFlushGraceMs: 60,
+        chunkTimeoutMs: 100,
+        nativeToolTimeoutMs: 500,
+      }),
+    })
+    try {
+      registry.updateContextSnapshot("ses_bg_cross_1", {
+        agent: "build",
+        tools: {
+          execute: { description: "Code Mode JS", input: { type: "object", properties: {} } },
+        },
+      })
+      const lm = createAgyLanguageModel("gemini-4-neon", registry)
+      const { stream: step1 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_bg_cross_1" },
+        prompt: [{ role: "user", content: [{ type: "text", text: "[SCENARIO:BG_NATIVE_ACROSS_MCP_STEPS]" }] }],
+      })
+      const parts1 = await readStreamParts(step1)
+      assertStepToolCallInvariant(parts1)
+
+      // Native background call was detached with a non-error running tool-result in Step 1
+      const detachedResult = parts1.find(
+        (p) => p.type === "tool-result" && p.toolCallId === "tc_bg_cross_step",
+      )
+      expect(detachedResult?.type).toBe("tool-result")
+      if (detachedResult?.type === "tool-result") {
+        expect(detachedResult.isError).toBe(false)
+      }
+
+      const relayedCall = parts1.find((p) => p.type === "tool-call" && p.toolName === "execute")
+      expect(relayedCall?.type).toBe("tool-call")
+      if (relayedCall?.type !== "tool-call") return
+
+      const { stream: step2 } = await lm.doStream({
+        headers: { "x-opencode-session-id": "ses_bg_cross_1" },
+        prompt: [
+          { role: "user", content: [{ type: "text", text: "[SCENARIO:BG_NATIVE_ACROSS_MCP_STEPS]" }] },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: relayedCall.toolCallId,
+                toolName: "execute",
+                output: { type: "text", value: "4/4 green" },
+              },
+            ],
+          },
+        ],
+      })
+      const parts2 = await readStreamParts(step2)
+      // Step 2 must NOT contain an orphan tool-result for tc_bg_cross_step, and must survive 180ms > 100ms chunkTimeoutMs
+      assertStepToolCallInvariant(parts2)
+      expect(parts2.some((p) => p.type === "error")).toBe(false)
+      expect(parts2.some((p) => p.type === "tool-result" && p.toolCallId === "tc_bg_cross_step")).toBe(false)
+      expect(textFromParts(parts2)).toContain("Queue check: 4/4 green")
+      expect(textFromParts(parts2)).toContain("CROSS_STEP_OK")
     } finally {
       await registry.disposeAll()
     }
