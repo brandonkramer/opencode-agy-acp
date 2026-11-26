@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -112,6 +112,16 @@ function assertStepToolCallInvariant(parts: readonly LanguageModelV3StreamPart[]
 }
 
 describe("SessionRegistry + fake-agy integration", () => {
+  let prevDiskCacheEnv: string | undefined
+  beforeAll(() => {
+    prevDiskCacheEnv = process.env.AGY_ACP_CATALOG_CACHE_PATH
+    process.env.AGY_ACP_CATALOG_CACHE_PATH = "off"
+  })
+  afterAll(() => {
+    if (prevDiskCacheEnv === undefined) delete process.env.AGY_ACP_CATALOG_CACHE_PATH
+    else process.env.AGY_ACP_CATALOG_CACHE_PATH = prevDiskCacheEnv
+  })
+
   test("1. Pure ACP turn emits thought, native tool, usage, and omits --process-per-session", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-1-"))
     const argsLog = path.join(tmp, "args.log")
@@ -1265,6 +1275,7 @@ describe("SessionRegistry + fake-agy integration", () => {
     resetSharedCatalogCacheForTests()
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-catalog-dedupe-"))
     const argsLog = path.join(tmp, "args.log")
+    const diskCache = path.join(tmp, "catalog-cache.json")
     const prevArgs = process.env.FAKE_AGY_ARGS_LOG
     process.env.FAKE_AGY_ARGS_LOG = argsLog
 
@@ -1274,6 +1285,7 @@ describe("SessionRegistry + fake-agy integration", () => {
       const { ctx } = createMockContext({ cwd: dir })
       return new SessionRegistry(ctx, {
         settings: makeSettings({ codeMode: false, prewarm: false }),
+        catalogCachePath: diskCache,
       })
     })
     try {
@@ -1291,6 +1303,7 @@ describe("SessionRegistry + fake-agy integration", () => {
       const { ctx: ctx4 } = createMockContext({ cwd: dir4 })
       const reg4 = new SessionRegistry(ctx4, {
         settings: makeSettings({ codeMode: false, prewarm: false }),
+        catalogCachePath: diskCache,
       })
       try {
         const status = await reg4.loadCachedModels()
@@ -1298,6 +1311,27 @@ describe("SessionRegistry + fake-agy integration", () => {
         expect(reg4.getModels().length).toBeGreaterThanOrEqual(2)
       } finally {
         await reg4.disposeAll()
+      }
+
+      // Simulating a brand-new OS process (empty in-memory cache + empty per-dir storage)
+      // still hits the warm cross-process disk cache with 0 extra agy spawns.
+      resetSharedCatalogCacheForTests()
+      const dir5 = path.join(tmp, "ws-5")
+      fs.mkdirSync(dir5, { recursive: true })
+      const { ctx: ctx5 } = createMockContext({ cwd: dir5 })
+      const reg5 = new SessionRegistry(ctx5, {
+        settings: makeSettings({ codeMode: false, prewarm: false }),
+        catalogCachePath: diskCache,
+      })
+      try {
+        const diskStatus = await reg5.loadCachedModels()
+        expect(diskStatus.stale).toBe(false)
+        const refreshed = await reg5.refreshModels({ force: false })
+        expect(refreshed.models.length).toBeGreaterThanOrEqual(2)
+        const spawnsAfterDiskHit = fs.readFileSync(argsLog, "utf8").trim().split("\n").filter(Boolean)
+        expect(spawnsAfterDiskHit).toHaveLength(1)
+      } finally {
+        await reg5.disposeAll()
       }
     } finally {
       resetSharedCatalogCacheForTests()

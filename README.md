@@ -11,7 +11,7 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
    - Full `elicitation/create` → OpenCode `question` bridge works in both Pure ACP and Code Mode.
 3. **Structured Effect concurrency & active-only warm worker pooling:**
    - Active-directory standby pre-warming (`prewarm: "auto"` by default — only prewarms workspaces that recently used `antigravity-acp`, avoiding idle spawns across unused worktrees) + shared warm side-call worker for isolated `/compact` & judge (`generate`) calls (~1.6s -> ~7ms per new session).
-   - Per-session `Semaphore(1)` serialization, 5-minute idle worker reaper (`idleTimeoutMs`, preserving `acpSessionId` for `session/resume`), and `retry: false` hook to prevent double-retries.
+   - Per-session `Semaphore(1)` serialization, 20-minute idle worker reaper (`idleTimeoutMs`, preserving `acpSessionId` for `session/resume`), and `retry: false` hook to prevent double-retries.
 4. **Real MCP isolation (`isolateUserMcp: true`, `includeDefaultCustomizations: false` by default):** Launches `agy acp` with an isolated `--gemini-dir` (empty `config/mcp_config.json`, symlinked `antigravity-cli/` for OAuth & session resume) so workers never spawn duplicate copies of `~/.gemini` MCP servers or bloat prompts with duplicate tool schemas.
 5. **Bounded permissions, MCP relay compaction (`maxMcpResultChars: 9800`), and accurate per-step usage accounting:** Compacts oversized relayed MCP outputs cleanly below `agy`'s inline truncation threshold (preserving saved-file pointers so `agy` never double-truncates JSON), and normalizes multi-step cumulative `agy` usage against live `usage_update` context occupancy so OpenCode's context meter and auto-compaction stay accurate.
 6. **Plan mode auto-sync (`defaultMode`, default `"auto"`):** Automatically switches `agy` to `"plan"` when using OpenCode's `plan` agent and back when leaving `plan` (unless explicitly overridden via RPC `setMode`).
@@ -38,7 +38,7 @@ A lean, deadlock-free OpenCode plugin for Google Antigravity CLI (`agy acp`), mo
         "chunkTimeoutMs": 120000,
         "nativeToolTimeoutMs": 900000,
         "permissionTimeoutMs": 300000,
-        "idleTimeoutMs": 300000
+        "idleTimeoutMs": 1200000
       }
     }
   }
@@ -82,6 +82,7 @@ No extra plugin configuration is needed — `codeMode: "auto"` automatically rel
 - `AGY_ACP_ISOLATE_USER_MCP=true|false`
 - `AGY_ACP_CHUNK_TIMEOUT_MS`
 - `AGY_ACP_NATIVE_TOOL_TIMEOUT_MS`
+- `AGY_ACP_CATALOG_CACHE_PATH` (`off` to disable cross-process disk model catalog cache)
 - `AGY_ACP_TRACE_LOG=/path/to/trace.jsonl`
 
 ## Development

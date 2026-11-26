@@ -1,3 +1,6 @@
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { AcpProcess, type AgyIO } from "./process.js"
 import {
   isRecord,
@@ -308,6 +311,165 @@ export function normalizeCatalog(models: readonly AcpDiscoveredModel[]): readonl
 
 export function catalogSignature(models: readonly AcpDiscoveredModel[]): string {
   return JSON.stringify(models.map((m) => [m.id, m.name, m.family, m.defaultAcpModelId, m.variants]))
+}
+
+const DISK_CATALOG_MAX_ENTRY_AGE_MS = 7 * 24 * 60 * 60 * 1000
+const DISK_CATALOG_LOCK_STALE_MS = 15_000
+
+export function resolveDiskCatalogCachePath(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (env.AGY_ACP_CATALOG_CACHE_PATH !== undefined) {
+    const raw = env.AGY_ACP_CATALOG_CACHE_PATH.trim()
+    if (!raw || raw === "none" || raw === "off" || raw === "0") return undefined
+    return raw
+  }
+  const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
+  if (!home) return undefined
+  const cacheRoot = env.XDG_CACHE_HOME?.trim() || path.join(home, ".cache")
+  return path.join(cacheRoot, "opencode-agy-acp", "model-catalog-v1.json")
+}
+
+export function readDiskCachedCatalog(
+  cacheKey: string,
+  ttlMs: number,
+  cachePath?: string,
+): { readonly models: readonly AcpDiscoveredModel[]; readonly updatedAt: number } | undefined {
+  const filePath = cachePath ?? resolveDiskCatalogCachePath()
+  if (!filePath) return undefined
+  try {
+    const raw = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown
+    if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.entries)) return undefined
+    const entry = raw.entries[cacheKey]
+    if (!isRecord(entry) || typeof entry.updatedAt !== "number" || !isValidCatalog(entry.models)) {
+      return undefined
+    }
+    if (Date.now() - entry.updatedAt > ttlMs) return undefined
+    return {
+      models: normalizeCatalog(entry.models),
+      updatedAt: entry.updatedAt,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+export function writeDiskCachedCatalog(
+  cacheKey: string,
+  models: readonly AcpDiscoveredModel[],
+  updatedAt: number,
+  cachePath?: string,
+): void {
+  const filePath = cachePath ?? resolveDiskCatalogCachePath()
+  if (!filePath || models.length === 0) return
+  try {
+    const dir = path.dirname(filePath)
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const entries: Record<string, { readonly updatedAt: number; readonly models: readonly AcpDiscoveredModel[] }> = {}
+    const now = Date.now()
+    try {
+      const existing = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown
+      if (isRecord(existing) && existing.version === 1 && isRecord(existing.entries)) {
+        for (const [k, v] of Object.entries(existing.entries)) {
+          if (
+            isRecord(v) &&
+            typeof v.updatedAt === "number" &&
+            now - v.updatedAt <= DISK_CATALOG_MAX_ENTRY_AGE_MS &&
+            isValidCatalog(v.models)
+          ) {
+            entries[k] = { updatedAt: v.updatedAt, models: normalizeCatalog(v.models) }
+          }
+        }
+      }
+    } catch {}
+    entries[cacheKey] = { updatedAt, models: normalizeCatalog(models) }
+    const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`
+    try {
+      fs.writeFileSync(tmpPath, JSON.stringify({ version: 1, entries }), { encoding: "utf8", mode: 0o600 })
+      fs.renameSync(tmpPath, filePath)
+    } catch {
+      try {
+        fs.unlinkSync(tmpPath)
+      } catch {}
+    }
+  } catch {}
+}
+
+/**
+ * Best-effort cooperative cross-process lock around cold model-catalog discovery so
+ * concurrent OpenCode processes/worktrees do not launch duplicate `agy acp` spawns.
+ */
+export function tryAcquireDiskCatalogLock(
+  cachePath?: string,
+): { readonly acquired: boolean; readonly release: () => void } {
+  const filePath = cachePath ?? resolveDiskCatalogCachePath()
+  if (!filePath) return { acquired: true, release: () => {} }
+  const lockPath = `${filePath}.lock`
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 })
+    const tryCreate = (): boolean => {
+      try {
+        const fd = fs.openSync(lockPath, "wx", 0o600)
+        try {
+          fs.writeSync(fd, `${process.pid}\n`)
+        } finally {
+          fs.closeSync(fd)
+        }
+        return true
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") return true
+        return false
+      }
+    }
+    if (!tryCreate()) {
+      try {
+        const st = fs.statSync(lockPath)
+        if (Date.now() - st.mtimeMs > DISK_CATALOG_LOCK_STALE_MS) {
+          fs.unlinkSync(lockPath)
+          if (!tryCreate()) return { acquired: false, release: () => {} }
+        } else {
+          return { acquired: false, release: () => {} }
+        }
+      } catch {
+        return { acquired: true, release: () => {} }
+      }
+    }
+    let released = false
+    return {
+      acquired: true,
+      release: () => {
+        if (released) return
+        released = true
+        try {
+          fs.unlinkSync(lockPath)
+        } catch {}
+      },
+    }
+  } catch {
+    return { acquired: true, release: () => {} }
+  }
+}
+
+export async function waitForDiskCachedCatalog(
+  cacheKey: string,
+  ttlMs: number,
+  cachePath?: string,
+  maxWaitMs = 4_000,
+): Promise<{ readonly models: readonly AcpDiscoveredModel[]; readonly updatedAt: number } | undefined> {
+  const filePath = cachePath ?? resolveDiskCatalogCachePath()
+  if (!filePath) return undefined
+  const lockPath = `${filePath}.lock`
+  const deadline = Date.now() + maxWaitMs
+  while (Date.now() < deadline) {
+    const found = readDiskCachedCatalog(cacheKey, ttlMs, filePath)
+    if (found) return found
+    if (!fs.existsSync(lockPath)) break
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, 120)
+      t.unref?.()
+    })
+  }
+  return readDiskCachedCatalog(cacheKey, ttlMs, filePath)
 }
 
 export async function discoverAcpModels(

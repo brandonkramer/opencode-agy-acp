@@ -378,4 +378,51 @@ describe("smooth streaming pacer (src/acp/turn.ts)", () => {
 
     expect(overrides).toEqual([900_000, 1_320_000, 900_000, undefined])
   })
+
+  test("usage accounting handles mid-turn compaction drops, oversized cumulative outputTokens, and local clean stops", async () => {
+    // Mid-turn native ACP auto-compaction (514K -> 45K): must report uncached prefix, not 100% cache hit
+    const compacted = buildStepUsage(45_029, 514_087)
+    expect(compacted.inputTokens).toEqual({
+      total: 45_029,
+      noCache: 45_029,
+      cacheRead: 0,
+      cacheWrite: 0,
+    })
+    // Next step builds cache from 45_029
+    const postCompact = buildStepUsage(47_500, 45_029)
+    expect(postCompact.inputTokens).toEqual({
+      total: 47_500,
+      noCache: 2_471,
+      cacheRead: 45_029,
+      cacheWrite: 0,
+    })
+
+    // Multi-step cumulative outputTokens dominating or exceeding live window is capped at 25% of window
+    const heavyMulti = buildFinalTurnUsage({
+      raw: {
+        inputTokens: 120_000,
+        cachedReadTokens: 880_000,
+        outputTokens: 42_015,
+        thoughtTokens: 20_233,
+        totalTokens: 1_042_015,
+      },
+      activeContextUsed: 80_276,
+    })
+    expect(heavyMulti.outputTokens.total).toBe(Math.floor(80_276 * 0.25))
+    expect((heavyMulti.inputTokens.total ?? 0) + (heavyMulti.outputTokens.total ?? 0)).toBe(80_276)
+    expect(heavyMulti.inputTokens.cacheRead).toBeGreaterThan(50_000)
+
+    // Local clean stop (e.g. plugin_unloaded) emits empty usage rather than fake 451K cache miss
+    const turn = makeTurn({ smoothStreaming: false })
+    const parts = await drainTurn(turn, () => {
+      turn.handleUpdate({ sessionUpdate: "usage_update", used: 451_357, size: 1_048_576 })
+      turn.finishCleanStop("Plugin reloaded", "plugin_unloaded", true)
+    })
+    const finish = parts.find((p) => p.type === "finish")
+    expect(finish?.type).toBe("finish")
+    if (finish?.type === "finish") {
+      expect(finish.usage.inputTokens.total).toBeUndefined()
+      expect(finish.usage.inputTokens.noCache).toBeUndefined()
+    }
+  })
 })

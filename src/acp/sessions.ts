@@ -31,7 +31,12 @@ import {
   discoverAcpModels,
   isValidCatalog,
   normalizeCatalog,
+  readDiskCachedCatalog,
   resolveAcpModelTarget,
+  resolveDiskCatalogCachePath,
+  tryAcquireDiskCatalogLock,
+  waitForDiskCachedCatalog,
+  writeDiskCachedCatalog,
 } from "./catalog.js"
 import {
   API_ERROR_ABORT_PATTERN,
@@ -155,6 +160,7 @@ interface Entry {
 export interface SessionRegistryOptions {
   readonly settings: AgySettings
   readonly io?: AgyIO
+  readonly catalogCachePath?: string | null
   readonly onCatalogChanged?: () => void
   readonly onStateChanged?: (sessionID: string) => void
 }
@@ -585,6 +591,15 @@ export class SessionRegistry {
     }
   }
 
+  private effectiveDiskCatalogPath(): string | undefined {
+    if (this.options.catalogCachePath === null) return undefined
+    if (typeof this.options.catalogCachePath === "string") {
+      return this.options.catalogCachePath.trim() || undefined
+    }
+    if (this.options.io !== undefined) return undefined
+    return resolveDiskCatalogCachePath()
+  }
+
   async loadCachedModels(): Promise<{ readonly stale: boolean }> {
     const cacheKey = sharedCatalogKeyFor(this.baseSettings, this.options.io)
     const shared = sharedCatalogCache.get(cacheKey)
@@ -600,9 +615,21 @@ export class SessionRegistry {
         const updatedAt = typeof raw.updatedAt === "number" ? raw.updatedAt : 0
         this.catalog = normalized
         this.catalogUpdatedAt = updatedAt
-        return { stale: Date.now() - updatedAt > MODEL_CATALOG_TTL_MS }
+        if (Date.now() - updatedAt <= MODEL_CATALOG_TTL_MS) {
+          return { stale: false }
+        }
       }
     } catch {}
+    const diskPath = this.effectiveDiskCatalogPath()
+    if (diskPath) {
+      const disk = readDiskCachedCatalog(cacheKey, MODEL_CATALOG_TTL_MS, diskPath)
+      if (disk && disk.models.length > 0) {
+        this.catalog = disk.models
+        this.catalogUpdatedAt = disk.updatedAt
+        sharedCatalogCache.set(cacheKey, { models: disk.models, updatedAt: disk.updatedAt })
+        return { stale: false }
+      }
+    }
     return { stale: true }
   }
 
@@ -642,6 +669,7 @@ export class SessionRegistry {
     }
 
     const cacheKey = sharedCatalogKeyFor(this.baseSettings, this.options.io)
+    const diskPath = this.effectiveDiskCatalogPath()
     const existingShared = sharedCatalogCache.get(cacheKey)
     if (
       !options?.force &&
@@ -655,24 +683,58 @@ export class SessionRegistry {
       return { models: existingShared.models, changed }
     }
 
+    if (!options?.force && diskPath) {
+      const disk = readDiskCachedCatalog(cacheKey, MODEL_CATALOG_TTL_MS, diskPath)
+      if (disk && disk.models.length > 0) {
+        const changed = catalogSignature(this.catalog) !== catalogSignature(disk.models)
+        this.catalog = disk.models
+        this.catalogUpdatedAt = disk.updatedAt
+        sharedCatalogCache.set(cacheKey, {
+          models: disk.models,
+          updatedAt: disk.updatedAt,
+          inFlight: existingShared?.inFlight,
+        })
+        await this.persistCatalog(disk.models, disk.updatedAt)
+        return { models: disk.models, changed }
+      }
+    }
+
     let inFlight = !options?.force ? existingShared?.inFlight : undefined
     if (!inFlight) {
       if (!this.catalogDiscoveryPromise) {
         const settingsSnapshot = this.baseSettings
+        const forceRefresh = Boolean(options?.force)
         const discovery = (async () => {
-          const discovered = await discoverAcpModels(
-            this.ctx.location.directory,
-            settingsSnapshot,
-            this.options.io,
-          )
-          const normalized = normalizeCatalog(discovered)
-          if (normalized.length > 0) {
-            const updatedAt = Date.now()
-            this.catalogUpdatedAt = updatedAt
-            sharedCatalogCache.set(cacheKey, { models: normalized, updatedAt })
-            await this.persistCatalog(normalized, updatedAt)
+          const lock = !forceRefresh && diskPath ? tryAcquireDiskCatalogLock(diskPath) : { acquired: true, release: () => {} }
+          try {
+            if (!lock.acquired && diskPath) {
+              const waited = await waitForDiskCachedCatalog(cacheKey, MODEL_CATALOG_TTL_MS, diskPath)
+              if (waited && waited.models.length > 0) {
+                this.catalogUpdatedAt = waited.updatedAt
+                sharedCatalogCache.set(cacheKey, { models: waited.models, updatedAt: waited.updatedAt })
+                await this.persistCatalog(waited.models, waited.updatedAt)
+                return waited.models
+              }
+            }
+            const discovered = await discoverAcpModels(
+              this.ctx.location.directory,
+              settingsSnapshot,
+              this.options.io,
+            )
+            const normalized = normalizeCatalog(discovered)
+            if (normalized.length > 0) {
+              const updatedAt = Date.now()
+              this.catalogUpdatedAt = updatedAt
+              sharedCatalogCache.set(cacheKey, { models: normalized, updatedAt })
+              if (diskPath) {
+                writeDiskCachedCatalog(cacheKey, normalized, updatedAt, diskPath)
+              }
+              await this.persistCatalog(normalized, updatedAt)
+            }
+            return normalized
+          } finally {
+            lock.release()
           }
-          return normalized
         })().finally(() => {
           this.catalogDiscoveryPromise = undefined
           const cur = sharedCatalogCache.get(cacheKey)
@@ -1242,6 +1304,10 @@ export class SessionRegistry {
           updatedAt,
           inFlight: existingShared?.inFlight,
         })
+        const diskPath = this.effectiveDiskCatalogPath()
+        if (diskPath) {
+          writeDiskCachedCatalog(cacheKey, live, updatedAt, diskPath)
+        }
         this.catalogUpdatedAt = updatedAt
         if (catalogSignature(live) !== catalogSignature(this.catalog)) {
           this.catalog = live

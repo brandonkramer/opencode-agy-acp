@@ -219,7 +219,11 @@ export function buildStepUsage(
   prevContextUsed = 0,
 ): LanguageModelV3Usage {
   const total = Math.max(0, Math.floor(contextUsed))
-  const cacheRead = prevContextUsed > 0 ? Math.min(Math.floor(prevContextUsed), total) : 0
+  const prev = Math.max(0, Math.floor(prevContextUsed))
+  // A steep drop (>25%) in live context occupancy indicates native ACP auto-compaction
+  // replaced the prompt prefix, so treat the compacted context as freshly uncached.
+  const compacted = prev > 0 && total < Math.floor(prev * 0.75)
+  const cacheRead = prev > 0 && !compacted ? Math.min(prev, total) : 0
   const noCache = Math.max(0, total - cacheRead)
   return {
     inputTokens: {
@@ -262,7 +266,26 @@ export function buildFinalTurnUsage(params: {
 
   const windowTokens = Math.floor(ctxUsed)
   const rawOutTotal = base.outputTokens.total ?? 0
-  const finalInputTotal = Math.max(0, windowTokens - Math.min(rawOutTotal, windowTokens))
+  // Multi-step cumulative `outputTokens` from ACP can exceed or dominate the final step's
+  // context window (especially after mid-turn compaction). Cap effective single-step output
+  // to at most 25% of the live window so `finalInputTotal` and `cacheRead` stay sane.
+  const maxStepOutput = Math.floor(windowTokens * 0.25)
+  let outputTokens = base.outputTokens
+  let effectiveOutTotal = rawOutTotal
+  if (rawOutTotal > maxStepOutput && maxStepOutput > 0) {
+    effectiveOutTotal = maxStepOutput
+    const rawReasoning = base.outputTokens.reasoning
+    const reasoning =
+      rawReasoning !== undefined && rawOutTotal > 0
+        ? Math.min(effectiveOutTotal, Math.round(effectiveOutTotal * (rawReasoning / rawOutTotal)))
+        : undefined
+    outputTokens = {
+      total: effectiveOutTotal,
+      text: Math.max(0, effectiveOutTotal - (reasoning ?? 0)),
+      reasoning,
+    }
+  }
+  const finalInputTotal = Math.max(0, windowTokens - Math.min(effectiveOutTotal, windowTokens))
   const rawCacheRead = base.inputTokens.cacheRead ?? 0
   const rawCacheWrite = base.inputTokens.cacheWrite ?? 0
   const emittedIn = params.emittedIntermediateInput ?? 0
@@ -289,7 +312,7 @@ export function buildFinalTurnUsage(params: {
       cacheRead: base.inputTokens.cacheRead !== undefined ? cacheRead : undefined,
       cacheWrite: base.inputTokens.cacheWrite !== undefined ? cacheWrite : undefined,
     },
-    outputTokens: base.outputTokens,
+    outputTokens,
   }
 }
 
@@ -1149,12 +1172,14 @@ export class ActiveTurn {
     this.emitPart({
       type: "finish",
       finishReason: { unified: "stop", raw: rawFinish },
-      usage: buildFinalTurnUsage({
-        raw: this.promptResult?.usage,
-        activeContextUsed: this.contextUsed,
-        emittedIntermediateInput: this.emittedIntermediateInput,
-        emittedIntermediateCacheRead: this.emittedIntermediateCacheRead,
-      }),
+      usage: local
+        ? buildUsage()
+        : buildFinalTurnUsage({
+            raw: this.promptResult?.usage,
+            activeContextUsed: this.contextUsed,
+            emittedIntermediateInput: this.emittedIntermediateInput,
+            emittedIntermediateCacheRead: this.emittedIntermediateCacheRead,
+          }),
       ...meta,
     })
 

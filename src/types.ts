@@ -76,7 +76,7 @@ export const DEFAULT_SETTINGS: AgySettings = {
   settleTimeoutMs: 3_000,
   permissionTimeoutMs: 300_000,
   nativeFlushGraceMs: 400,
-  idleTimeoutMs: 5 * 60_000,
+  idleTimeoutMs: 20 * 60_000,
   extraDirs: [],
 }
 
